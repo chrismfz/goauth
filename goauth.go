@@ -55,9 +55,14 @@ func (c *Config) withDefaults() {
 	if c.SessionTTL == 0 {
 		c.SessionTTL = 8 * time.Hour
 	}
-	if c.IdleTimeout == 0 {
-		c.IdleTimeout = 30 * time.Minute
-	}
+
+//	if c.IdleTimeout == 0 {
+//		c.IdleTimeout = 30 * time.Minute
+//	}
+// IdleTimeout intentionally has no default — leaving it at 0 disables it.
+// When enabled, scs commits the session on every request to update last-access,
+// causing SQLITE_BUSY storms under concurrent load.
+
 	if c.CookieName == "" {
 		c.CookieName = "__Host-sid"
 	}
@@ -115,6 +120,14 @@ func New(cfg Config) (*Manager, error) {
 	sm.Cookie.Secure = cfg.SecureCookie
 	sm.Cookie.SameSite = cfg.SameSite
 	sm.Cookie.Path = "/"
+
+// Don't let session commit failures return 500 to the client.
+// The request still succeeds; the session just won't be extended this tick.
+sm.ErrorFunc = func(w http.ResponseWriter, r *http.Request, err error) {
+    // log but do not write an error response — the handler already responded
+    _ = err
+}
+
 
 	m := &Manager{
 		cfg:     cfg,
