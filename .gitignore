@@ -1,0 +1,16 @@
+# Binaries
+goauth
+*.exe
+
+# Go build cache
+/dist/
+
+# SQLite databases (test artifacts)
+*.db
+*.db-shm
+*.db-wal
+
+# Editor
+.idea/
+.vscode/
+*.swp
