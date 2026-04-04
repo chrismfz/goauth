@@ -109,6 +109,13 @@ func (m *Manager) denyForbidden(w http.ResponseWriter, r *http.Request, username
 	w.Write([]byte(`{"error":"forbidden"}`))
 }
 
+// IsAuthenticated reports whether the request carries a valid, active session.
+// Requires LoadAndSave to have already run (i.e. must be called from within
+// the handler chain, not before the mux).
+func (m *Manager) IsAuthenticated(r *http.Request) bool {
+	return m.session.GetString(r.Context(), sessionUsernameKey) != ""
+}
+
 // isBrowserRequest returns true when the client is likely a browser
 // (Accept header contains text/html).
 func isBrowserRequest(r *http.Request) bool {
