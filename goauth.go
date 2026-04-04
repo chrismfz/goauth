@@ -45,6 +45,10 @@ type Config struct {
 	// OnAuthFailure, if set, overrides the default redirect/401 behaviour
 	// for the Require middleware. Useful for fully custom error pages.
 	OnAuthFailure func(w http.ResponseWriter, r *http.Request, reason string)
+
+	// LoginRateLimit, if set, enables per-IP and per-username rate limiting
+	// on the login endpoint. Defaults to true when using LoginHandler().
+	LoginRateLimit bool
 }
 
 func (c *Config) withDefaults() {
@@ -71,6 +75,7 @@ type Manager struct {
 	db      *sql.DB
 	Users   *UserStore
 	session *scs.SessionManager
+	rl      *loginRateLimiter
 }
 
 // New opens (or creates) the SQLite database at cfg.DBPath, runs schema
@@ -116,6 +121,7 @@ func New(cfg Config) (*Manager, error) {
 		db:      db,
 		Users:   &UserStore{db: db},
 		session: sm,
+		rl:      newLoginRateLimiter(),
 	}
 	return m, nil
 }

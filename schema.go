@@ -23,6 +23,19 @@ func runMigrations(db *sql.DB) error {
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expiry)`,
+
+		// Auth audit log — records every login attempt and rate-limit hit.
+		`CREATE TABLE IF NOT EXISTS auth_log (
+			id       INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts       INTEGER NOT NULL,
+			event    TEXT    NOT NULL,
+			username TEXT    NOT NULL DEFAULT '',
+			ip       TEXT    NOT NULL DEFAULT '',
+			reason   TEXT    NOT NULL DEFAULT ''
+		)`,
+
+		`CREATE INDEX IF NOT EXISTS auth_log_ts_idx ON auth_log(ts)`,
+		`CREATE INDEX IF NOT EXISTS auth_log_ip_idx ON auth_log(ip)`,
 	}
 
 	for _, s := range stmts {
