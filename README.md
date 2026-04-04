@@ -10,6 +10,8 @@ Used by [CFM](https://github.com/chrismfz/cfm), [Argus](https://github.com/chris
 - **Hardened cookies** — `HttpOnly`, `Secure`, `SameSite=Strict`, `__Host-` prefix support
 - **Role-based access control** — `Require("admin")` middleware
 - **Zero CGO** — uses `modernc.org/sqlite` (pure Go)
+- **Login rate limiting** — per-IP and per-username sliding window, 429 + Retry-After
+- **Audit log** — every login attempt recorded to SQLite (SUCCESS, FAIL, RATELIMIT)
 - **Embedded CLI** — manage users and sessions from inside your own binary (recommended)
 - **`IsAuthenticated()`** — session check for use inside your own middleware
 - **`Destroy()`** — session destruction without writing a response body (for custom redirects)
@@ -703,6 +705,168 @@ alongside your service binary.
 
 ---
 
+---
+
+## Rate limiting
+
+`LoginHandler()` enforces two independent sliding-window rate limits
+out of the box — no configuration required:
+
+| Limit | Default | Scope |
+|---|---|---|
+| Per IP | 10 attempts / 60s | blocks credential stuffing from a single source |
+| Per username | 20 attempts / 10min | blocks distributed attacks against one account |
+
+When a limit is breached the handler returns `429 Too Many Requests`
+with a `Retry-After` header and writes a `RATELIMIT` entry to `auth_log`.
+The in-memory counters are pruned automatically every 5 minutes.
+
+To tune the thresholds, edit `ratelimit.go`:
+
+```go
+func newLoginRateLimiter() *loginRateLimiter {
+    return &loginRateLimiter{
+        windowIP:   time.Minute,
+        windowUser: 10 * time.Minute,
+        maxPerIP:   10,  // attempts per window per IP
+        maxPerUser: 20,  // attempts per window per username
+    }
+}
+```
+
+The client IP is resolved through `X-Forwarded-For` when the connection
+comes from loopback (nginx proxy), so the real browser IP is always used
+for rate limiting — not `127.0.0.1`.
+
+---
+
+## Audit log
+
+Every login attempt is written to the `auth_log` SQLite table:
+
+| event | reason | meaning |
+|---|---|---|
+| `SUCCESS` | — | credentials OK, session created |
+| `FAIL` | `bad_credentials` | wrong password or unknown user |
+| `FAIL` | `user_inactive` | account exists but is disabled |
+| `FAIL` | `internal_error` | database or hashing error |
+| `RATELIMIT` | `too_many_attempts_ip` | IP limit exceeded |
+| `RATELIMIT` | `too_many_attempts_user` | username limit exceeded |
+
+### Querying from Go
+
+```go
+// Last 100 entries, newest first
+entries, err := auth.QueryAuthLog(100)
+
+// Filter by IP
+entries, err := auth.QueryAuthLogByIP("5.5.5.5", 50)
+
+// Purge entries older than 90 days
+n, err := auth.PurgeAuthLog(90 * 24 * time.Hour)
+```
+
+### Querying from the CLI
+
+```bash
+# Show last 50 attempts (default)
+myapp auth log tail
+
+# Show last 200 attempts
+myapp auth log tail -n 200
+
+# Filter by source IP
+myapp auth log tail --ip 5.5.5.5
+
+# Delete entries older than 90 days
+myapp auth log purge --days 90
+```
+
+Sample output:
+
+```
+TIME                  EVENT      USERNAME   IP               REASON
+----                  -----      --------   --               ------
+2026-04-04 16:05:01   SUCCESS    chris      2.85.101.222
+2026-04-04 16:04:58   FAIL       chris      2.85.101.222     bad_credentials
+2026-04-04 16:04:55   FAIL       chris      2.85.101.222     bad_credentials
+2026-04-04 16:04:40   RATELIMIT  admin      5.5.5.5          too_many_attempts_ip
+2026-04-04 16:04:38   FAIL       admin      5.5.5.5          bad_credentials
+```
+
+### Wiring the log CLI commands into your embedded CLI
+
+Add to `runAuthCLI()` in `cmd/myapp/auth_cli.go`:
+
+```go
+logCmd := &cobra.Command{Use: "log", Short: "View auth audit log"}
+logCmd.AddCommand(
+    authCmdLogTail(&dbPath),
+    authCmdLogPurge(&dbPath),
+)
+root.AddCommand(userCmd, sessionCmd, logCmd)
+```
+
+Then add the two command functions:
+
+```go
+func authCmdLogTail(dbPath *string) *cobra.Command {
+    var limit int
+    var ip string
+    cmd := &cobra.Command{
+        Use:   "tail",
+        Short: "Show recent login attempts",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+
+            var entries []goauth.AuthLogEntry
+            if ip != "" {
+                entries, err = m.QueryAuthLogByIP(ip, limit)
+            } else {
+                entries, err = m.QueryAuthLog(limit)
+            }
+            if err != nil { return err }
+            if len(entries) == 0 { fmt.Println("No auth log entries."); return nil }
+
+            tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+            fmt.Fprintln(tw, "TIME\tEVENT\tUSERNAME\tIP\tREASON")
+            for _, e := range entries {
+                fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+                    e.Time.Format("2006-01-02 15:04:05"),
+                    e.Event, e.Username, e.IP, e.Reason,
+                )
+            }
+            tw.Flush()
+            return nil
+        },
+    }
+    cmd.Flags().IntVarP(&limit, "count", "n", 50, "Number of entries to show")
+    cmd.Flags().StringVar(&ip, "ip", "", "Filter by IP address")
+    return cmd
+}
+
+func authCmdLogPurge(dbPath *string) *cobra.Command {
+    var days int
+    cmd := &cobra.Command{
+        Use:   "purge",
+        Short: "Delete auth log entries older than N days",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            n, err := m.PurgeAuthLog(time.Duration(days) * 24 * time.Hour)
+            if err != nil { return err }
+            fmt.Printf("✓ Purged %d auth log entries older than %d days\n", n, days)
+            return nil
+        },
+    }
+    cmd.Flags().IntVar(&days, "days", 90, "Delete entries older than this many days")
+    return cmd
+}
+```
+
 ## Configuration reference
 
 | Field | Default | Description |
@@ -724,7 +888,7 @@ name (e.g. `myapp-sid`) when running over HTTP locally.
 
 ## Database schema
 
-Two tables are created automatically on first run:
+Three tables are created automatically on first run:
 
 ```sql
 CREATE TABLE users (
@@ -741,6 +905,16 @@ CREATE TABLE sessions (
     token  TEXT    PRIMARY KEY,
     data   BLOB    NOT NULL,
     expiry INTEGER NOT NULL
+);
+
+-- Login audit log — every attempt is recorded here
+CREATE TABLE auth_log (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       INTEGER NOT NULL,
+    event    TEXT    NOT NULL,  -- SUCCESS | FAIL | RATELIMIT
+    username TEXT    NOT NULL DEFAULT '',
+    ip       TEXT    NOT NULL DEFAULT '',
+    reason   TEXT    NOT NULL DEFAULT ''  -- bad_credentials | user_inactive | too_many_attempts_ip | too_many_attempts_user
 );
 ```
 
@@ -763,7 +937,5 @@ CREATE TABLE sessions (
 ## Roadmap
 
 - [ ] TOTP / 2FA support
-- [ ] Login attempt audit log
-- [ ] Rate limiting on `/login`
 - [ ] `session kill <token>` CLI command
 - [ ] `user import` from htpasswd (migration helper)
