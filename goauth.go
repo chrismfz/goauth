@@ -132,3 +132,9 @@ func (m *Manager) Close() error {
 func (m *Manager) LoadAndSave(next http.Handler) http.Handler {
 	return m.session.LoadAndSave(next)
 }
+
+// Destroy invalidates the current session. Used when the caller wants to
+// handle the HTTP response itself (e.g. redirect instead of JSON).
+func (m *Manager) Destroy(r *http.Request) error {
+	return m.session.Destroy(r.Context())
+}
