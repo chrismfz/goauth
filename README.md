@@ -939,3 +939,25 @@ CREATE TABLE auth_log (
 - [ ] TOTP / 2FA support
 - [ ] `session kill <token>` CLI command
 - [ ] `user import` from htpasswd (migration helper)
+
+- [ ] **Pluggable auth backends** — extract `UserStore` into a `UserBackend`
+      interface so any credential source can be swapped in without touching
+      sessions, cookies, rate limiting or audit log.
+
+      Planned backends:
+      - `sqlite` — current default, full CRUD
+      - `htpasswd` — read-only, bcrypt comparison, migration bridge
+      - `pam` — Linux PAM via CGO, roles derived from Unix groups
+      - `ldap` — LDAP / Active Directory, roles from `memberOf`
+      - `postgres` / `mysql` — shared auth DB for multi-server deployments
+      - `dovecot` — mail account auth via dovecot auth socket
+      - `http` — delegate to upstream REST auth API
+      - `oidc` — OAuth2 / OpenID Connect (Auth0, Keycloak, Google, GitHub)
+
+      Read-only backends (ldap, dovecot, oidc) return `ErrNotSupported`
+      for write ops — the CLI prints a helpful message instead of failing.
+
+      Migration path between backends:
+	argus auth migrate export --format json > users.json
+	argus auth migrate import --format json < users.json
+
