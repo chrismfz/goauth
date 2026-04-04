@@ -1,6 +1,6 @@
 # goauth
 
-Reusable session-based authentication and authorization for Go services.  
+Reusable session-based authentication and authorization for Go services.
 Used by [CFM](https://github.com/chrismfz/cfm), [Argus](https://github.com/chrismfz/argus), and future projects.
 
 ## Features
@@ -10,33 +10,31 @@ Used by [CFM](https://github.com/chrismfz/cfm), [Argus](https://github.com/chris
 - **Hardened cookies** — `HttpOnly`, `Secure`, `SameSite=Strict`, `__Host-` prefix support
 - **Role-based access control** — `Require("admin")` middleware
 - **Zero CGO** — uses `modernc.org/sqlite` (pure Go)
-- **`goauth` CLI** — manage users and sessions from the console
+- **Embedded CLI** — manage users and sessions from inside your own binary (recommended)
+- **`IsAuthenticated()`** — session check for use inside your own middleware
+- **`Destroy()`** — session destruction without writing a response body (for custom redirects)
 
 ---
 
 ## Installation
 
 ```bash
-# As a library
 go get github.com/chrismfz/goauth
-
-# CLI binary
-go install github.com/chrismfz/goauth/cmd/goauth@latest
 ```
 
 ---
 
-## Library Usage
+## Quick start
 
 ```go
 import "github.com/chrismfz/goauth"
 
 func main() {
     auth, err := goauth.New(goauth.Config{
-        DBPath:       "/etc/cfm/auth.db",
+        DBPath:       "/etc/myapp/auth.db",
         SessionTTL:   8 * time.Hour,
         IdleTimeout:  30 * time.Minute,
-        CookieName:   "__Host-cfm-sid",
+        CookieName:   "__Host-sid",
         SecureCookie: true,
     })
     if err != nil {
@@ -46,7 +44,7 @@ func main() {
 
     mux := http.NewServeMux()
 
-    // Auth endpoints
+    // Public auth endpoints
     mux.HandleFunc("POST /login",  auth.LoginHandler())
     mux.HandleFunc("POST /logout", auth.LogoutHandler())
     mux.HandleFunc("GET /me",      auth.Require()(auth.MeHandler()))
@@ -55,7 +53,8 @@ func main() {
     mux.Handle("GET /api/status", auth.Require()(statusHandler))
     mux.Handle("GET /admin/",     auth.Require("admin")(adminHandler))
 
-    // LoadAndSave must wrap the entire router
+    // LoadAndSave MUST be the outermost wrapper — it loads and saves the
+    // session on every request. Everything beneath it can read session state.
     log.Fatal(http.ListenAndServe(":8080", auth.LoadAndSave(mux)))
 }
 ```
@@ -73,9 +72,9 @@ func myHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-### Login endpoint (POST /login)
+### Login endpoint
 
-Accepts JSON:
+`POST /login` — accepts JSON:
 
 ```json
 { "username": "chris", "password": "hunter2" }
@@ -89,39 +88,622 @@ Returns on success:
 
 ---
 
-## CLI Usage
+## Real-world integration: layered auth (Argus / CFM pattern)
 
-```bash
-# Create initial admin user
-goauth --db /etc/cfm/auth.db user add -u chris -r admin
+Many services already have IP allowlists and Bearer token auth for API/CLI
+access, and only need session auth added for browser users — without breaking
+existing callers. This is the pattern used in Argus and CFM.
 
-# List all users
-goauth --db /etc/cfm/auth.db user list
+### The problem: nginx makes everything look like loopback
 
-# Detailed info
-goauth --db /etc/cfm/auth.db user info -u chris
+When nginx (or any reverse proxy) sits in front of your Go service, all
+requests arrive at the service as `127.0.0.1`. A naive `r.RemoteAddr`
+loopback check trusts everything unconditionally — so session enforcement is
+never reached for proxied browser requests.
 
-# Change password (prompted securely)
-goauth --db /etc/cfm/auth.db user passwd -u chris
+### Solution: realIP + realIPAllowed
 
-# Update roles
-goauth --db /etc/cfm/auth.db user roles -u chris -r admin,viewer
+Trust `X-Forwarded-For` **only when the direct connection is from loopback**.
+External clients cannot inject XFF when they connect directly — only a
+trusted local proxy (nginx) can set it.
 
-# Disable / re-enable without deleting
-goauth --db /etc/cfm/auth.db user deactivate -u someuser
-goauth --db /etc/cfm/auth.db user activate   -u someuser
+```go
+// realIP returns the true client IP.
+// When the direct connection is from loopback (nginx proxying), reads
+// X-Forwarded-For to get the actual client address.
+// XFF is only trusted from loopback — external clients cannot spoof it.
+func realIP(r *http.Request) net.IP {
+    host, _, _ := net.SplitHostPort(r.RemoteAddr)
+    directIP := net.ParseIP(host)
 
-# Delete permanently (requires --force)
-goauth --db /etc/cfm/auth.db user delete -u someuser --force
+    if directIP != nil && directIP.IsLoopback() {
+        if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+            first := strings.TrimSpace(strings.Split(fwd, ",")[0])
+            if ip := net.ParseIP(first); ip != nil {
+                return ip
+            }
+        }
+        // Loopback with no XFF = local tool (CLI, curl on server) → still loopback
+        return directIP
+    }
+    return directIP
+}
 
-# Session management
-goauth --db /etc/cfm/auth.db session list
-goauth --db /etc/cfm/auth.db session purge
+// realIPAllowed checks the true client IP against a CIDR/IP allowlist.
+// Use this in all auth middleware instead of checking r.RemoteAddr directly.
+func realIPAllowed(r *http.Request, cidrs []string) bool {
+    ip := realIP(r)
+    if ip == nil {
+        return false
+    }
+    if ip.IsLoopback() {
+        return true
+    }
+    for _, c := range cidrs {
+        if _, n, err := net.ParseCIDR(c); err == nil && n.Contains(ip) {
+            return true
+        }
+        if net.ParseIP(c) != nil && ip.Equal(net.ParseIP(c)) {
+            return true
+        }
+    }
+    return false
+}
+```
+
+### sessionAllowed helper
+
+```go
+var Auth *goauth.Manager // set at startup from main.go
+
+// sessionAllowed returns true if the request carries a valid goauth session.
+// Requires Auth to be non-nil and LoadAndSave to have already run.
+func sessionAllowed(r *http.Request) bool {
+    return Auth != nil && Auth.IsAuthenticated(r)
+}
+```
+
+### The middleware stack
+
+```
+Request
+  → Auth.LoadAndSave()     loads session from cookie into context
+  → globalGuard()          rate limiting, ban, body cap  (uses r.RemoteAddr — intentional)
+  → mux routing
+  → WithMainIPOnly()        per-route: realIP + session check
+  → handler
+```
+
+`globalGuard` deliberately keeps using `r.RemoteAddr` so local tools (CLI,
+curl on the server) are never rate-limited or banned. Only the per-route
+middleware uses `realIP`.
+
+### WithMainIPOnly — browser-facing routes
+
+Used for dashboard, telemetry, debug pages. Redirects browsers to `/login`,
+returns 403 for non-browser clients.
+
+```go
+func WithMainIPOnly(h http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Real client IP — sees through nginx proxy via XFF
+        if realIPAllowed(r, config.AllowIPs) {
+            h(w, r)
+            return
+        }
+        // Valid session cookie
+        if sessionAllowed(r) {
+            h(w, r)
+            return
+        }
+        // Unauthenticated — redirect browsers, block API clients
+        if strings.Contains(r.Header.Get("Accept"), "text/html") {
+            http.Redirect(w, r, "/login?next="+r.URL.RequestURI(), http.StatusSeeOther)
+            return
+        }
+        http.Error(w, "Forbidden", http.StatusForbidden)
+    }
+}
+
+// WithMainIPOnlyHandler wraps http.Handler instead of http.HandlerFunc.
+// Used for pprof.Handler() and similar.
+func WithMainIPOnlyHandler(h http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if realIPAllowed(r, config.AllowIPs) {
+            h.ServeHTTP(w, r)
+            return
+        }
+        if sessionAllowed(r) {
+            h.ServeHTTP(w, r)
+            return
+        }
+        http.Error(w, "Forbidden", http.StatusForbidden)
+    })
+}
+```
+
+### WithAuth — API routes (IP + Bearer token + session)
+
+Used for mutating API endpoints. Accepts any of: trusted IP, valid Bearer
+token, or valid session cookie. Fully backwards-compatible with existing
+API/CLI callers.
+
+```go
+func WithAuth(handler http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Trusted IP (real IP, sees through proxy)
+        if realIPAllowed(r, config.AllowIPs) {
+            handler(w, r)
+            return
+        }
+        // Bearer token (external API callers, scripts, CFM integration)
+        if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+            token := auth[7:]
+            for _, t := range config.Tokens {
+                if token == t {
+                    handler(w, r)
+                    return
+                }
+            }
+        }
+        // Session cookie (authenticated browser users)
+        if sessionAllowed(r) {
+            handler(w, r)
+            return
+        }
+        http.Error(w, "Forbidden", http.StatusForbidden)
+    }
+}
+```
+
+> **Critical:** `WithAuth` must use `realIPAllowed`, not `ipAllowed` /
+> `r.RemoteAddr`. If it uses `r.RemoteAddr`, all requests through nginx pass
+> unconditionally since they appear as `127.0.0.1`, making Bearer token and
+> session checks unreachable — i.e. any unauthenticated browser request gets
+> through.
+
+### Registering auth routes
+
+```go
+// Public — no guard. Must be registered before any catch-all handler.
+mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case http.MethodGet:
+        serveLoginPage(w, r)      // your HTML login form
+    case http.MethodPost:
+        Auth.LoginHandler()(w, r) // goauth handles credentials + session
+    default:
+        http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+    }
+})
+mux.HandleFunc("/logout", handleLogout)
+
+// Wrap the whole stack — LoadAndSave must be outermost
+inner := withRecovery(globalGuard(mux))
+var handler http.Handler = inner
+if Auth != nil {
+    handler = Auth.LoadAndSave(inner)
+}
+```
+
+### Custom logout with redirect
+
+`LogoutHandler()` writes a JSON response body. For a browser logout that
+redirects to `/login`, use `Destroy()` directly — it destroys the session
+without writing anything to the response:
+
+```go
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+    if Auth != nil {
+        Auth.Destroy(r) // destroys session, writes nothing
+    }
+    http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+```
+
+### nginx configuration
+
+nginx must forward the real client IP via `X-Forwarded-For`. Remove
+`auth_basic` entirely — goauth handles authentication.
+
+```nginx
+server {
+    server_name myapp.example.com;
+    # No auth_basic — goauth handles it
+
+    location / {
+        proxy_pass            http://127.0.0.1:9600;
+        proxy_set_header      Host            $host;
+        proxy_set_header      X-Real-IP       $remote_addr;
+        proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # SSE streams — buffering must be off, XFF still required
+    location ~ ^/tel/.*/stream {
+        proxy_pass         http://127.0.0.1:9600;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+### config.yaml
+
+```yaml
+auth:
+  db_path:       /opt/myapp/etc/auth.db
+  session_ttl:   8h
+  idle_timeout:  30m
+  secure_cookie: true      # false only for local HTTP testing
+  cookie_name:   myapp-sid # use __Host-myapp-sid for extra browser hardening
+```
+
+### Initialising in main.go
+
+```go
+import "github.com/chrismfz/goauth"
+
+// After config is loaded, before server starts:
+if cfg.Auth.DBPath != "" {
+    authMgr, err := goauth.New(goauth.Config{
+        DBPath:       cfg.Auth.DBPath,
+        SessionTTL:   cfg.Auth.SessionTTL,
+        IdleTimeout:  cfg.Auth.IdleTimeout,
+        CookieName:   cfg.Auth.CookieName,
+        SecureCookie: cfg.Auth.SecureCookie,
+    })
+    if err != nil {
+        log.Fatalf("[AUTH] failed to init: %v", err)
+    }
+    api.Auth = authMgr
+    defer authMgr.Close()
+    log.Printf("[AUTH] session store: %s", cfg.Auth.DBPath)
+} else {
+    log.Printf("[AUTH] db_path not configured — browser auth disabled")
+}
 ```
 
 ---
 
-## Configuration
+## Embedding the CLI in your binary (recommended)
+
+Rather than shipping a separate binary, embed user/session management
+directly in your service binary. One binary to deploy, no extra install step,
+consistent DB path defaults.
+
+In `cmd/myapp/main.go`, short-circuit before any config or server init:
+
+```go
+func main() {
+    // Auth CLI — short-circuits before config load or server start.
+    // The service does not need to be running.
+    if len(os.Args) > 1 && os.Args[1] == "auth" {
+        os.Args = append(os.Args[:1], os.Args[2:]...)
+        runAuthCLI()
+        return
+    }
+    // ... normal server startup
+}
+```
+
+Create `cmd/myapp/auth_cli.go` (same package as main.go):
+
+```go
+package main
+
+import (
+    "fmt"
+    "os"
+    "strings"
+    "syscall"
+    "text/tabwriter"
+    "time"
+
+    "github.com/chrismfz/goauth"
+    "github.com/spf13/cobra"
+    "golang.org/x/term"
+)
+
+const defaultAuthDB = "/opt/myapp/etc/auth.db"
+
+func runAuthCLI() {
+    var dbPath string
+
+    root := &cobra.Command{
+        Use:          "myapp auth",
+        Short:        "Manage users and sessions",
+        SilenceUsage: true,
+    }
+    root.PersistentFlags().StringVar(&dbPath, "db", defaultAuthDB, "Auth database path")
+
+    userCmd := &cobra.Command{Use: "user", Short: "Manage user accounts"}
+    userCmd.AddCommand(
+        authCmdUserAdd(&dbPath),
+        authCmdUserList(&dbPath),
+        authCmdUserPasswd(&dbPath),
+        authCmdUserRoles(&dbPath),
+        authCmdUserActivate(&dbPath),
+        authCmdUserDeactivate(&dbPath),
+        authCmdUserDelete(&dbPath),
+    )
+
+    sessionCmd := &cobra.Command{Use: "session", Short: "Manage sessions"}
+    sessionCmd.AddCommand(
+        authCmdSessionList(&dbPath),
+        authCmdSessionPurge(&dbPath),
+    )
+
+    root.AddCommand(userCmd, sessionCmd)
+    if err := root.Execute(); err != nil {
+        os.Exit(1)
+    }
+}
+
+func authOpen(dbPath *string) (*goauth.Manager, error) {
+    return goauth.New(goauth.Config{
+        DBPath:       *dbPath,
+        SessionTTL:   8 * time.Hour,
+        SecureCookie: false, // irrelevant for CLI
+    })
+}
+
+func authPromptPassword(prompt string) (string, error) {
+    fmt.Fprint(os.Stderr, prompt)
+    if term.IsTerminal(int(syscall.Stdin)) {
+        b, err := term.ReadPassword(int(syscall.Stdin))
+        fmt.Fprintln(os.Stderr)
+        return string(b), err
+    }
+    var pw string
+    _, err := fmt.Scanln(&pw)
+    return pw, err
+}
+
+func authCmdUserAdd(dbPath *string) *cobra.Command {
+    var username, password string
+    var roles []string
+    cmd := &cobra.Command{
+        Use:   "add",
+        Short: "Create a new user",
+        Example: "  myapp auth user add -u chris -r admin",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            if password == "" {
+                var err error
+                password, err = authPromptPassword("Password: ")
+                if err != nil { return err }
+                confirm, err := authPromptPassword("Confirm password: ")
+                if err != nil { return err }
+                if password != confirm { return fmt.Errorf("passwords do not match") }
+            }
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            if err := m.Users.Create(username, password, roles); err != nil { return err }
+            fmt.Printf("✓ User %q created with roles: [%s]\n", username, strings.Join(roles, ", "))
+            return nil
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.Flags().StringVarP(&password, "password", "p", "", "Password (prompted securely if omitted)")
+    cmd.Flags().StringSliceVarP(&roles, "roles", "r", []string{}, "Comma-separated roles")
+    cmd.MarkFlagRequired("username")
+    return cmd
+}
+
+func authCmdUserList(dbPath *string) *cobra.Command {
+    return &cobra.Command{
+        Use:     "list",
+        Aliases: []string{"ls"},
+        Short:   "List all users",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            users, err := m.Users.List()
+            if err != nil { return err }
+            if len(users) == 0 { fmt.Println("No users."); return nil }
+            tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+            fmt.Fprintln(tw, "ID\tUSERNAME\tROLES\tACTIVE\tCREATED")
+            fmt.Fprintln(tw, "--\t--------\t-----\t------\t-------")
+            for _, u := range users {
+                active := "yes"
+                if !u.Active { active = "no" }
+                fmt.Fprintf(tw, "%d\t%s\t[%s]\t%s\t%s\n",
+                    u.ID, u.Username, strings.Join(u.Roles, ", "),
+                    active, u.CreatedAt.Format("2006-01-02 15:04"))
+            }
+            tw.Flush()
+            return nil
+        },
+    }
+}
+
+func authCmdUserPasswd(dbPath *string) *cobra.Command {
+    var username, password string
+    cmd := &cobra.Command{
+        Use:   "passwd",
+        Short: "Change a user's password",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            if password == "" {
+                var err error
+                password, err = authPromptPassword("New password: ")
+                if err != nil { return err }
+                confirm, err := authPromptPassword("Confirm: ")
+                if err != nil { return err }
+                if password != confirm { return fmt.Errorf("passwords do not match") }
+            }
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            if err := m.Users.SetPassword(username, password); err != nil { return err }
+            fmt.Printf("✓ Password updated for %q\n", username)
+            return nil
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.Flags().StringVarP(&password, "password", "p", "", "New password (prompted if omitted)")
+    cmd.MarkFlagRequired("username")
+    return cmd
+}
+
+func authCmdUserRoles(dbPath *string) *cobra.Command {
+    var username string
+    var roles []string
+    cmd := &cobra.Command{
+        Use:   "roles",
+        Short: "Replace role list for a user",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            if err := m.Users.SetRoles(username, roles); err != nil { return err }
+            fmt.Printf("✓ Roles for %q: [%s]\n", username, strings.Join(roles, ", "))
+            return nil
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.Flags().StringSliceVarP(&roles, "roles", "r", nil, "New roles (replaces existing)")
+    cmd.MarkFlagRequired("username")
+    cmd.MarkFlagRequired("roles")
+    return cmd
+}
+
+func authCmdUserActivate(dbPath *string) *cobra.Command {
+    var username string
+    cmd := &cobra.Command{Use: "activate", Short: "Re-enable a disabled user",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            return authSetActive(dbPath, username, true)
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.MarkFlagRequired("username")
+    return cmd
+}
+
+func authCmdUserDeactivate(dbPath *string) *cobra.Command {
+    var username string
+    cmd := &cobra.Command{Use: "deactivate", Short: "Disable a user account",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            return authSetActive(dbPath, username, false)
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.MarkFlagRequired("username")
+    return cmd
+}
+
+func authSetActive(dbPath *string, username string, active bool) error {
+    m, err := authOpen(dbPath)
+    if err != nil { return err }
+    defer m.Close()
+    if err := m.Users.SetActive(username, active); err != nil { return err }
+    state := "activated"
+    if !active { state = "deactivated" }
+    fmt.Printf("✓ User %q %s\n", username, state)
+    return nil
+}
+
+func authCmdUserDelete(dbPath *string) *cobra.Command {
+    var username string
+    var force bool
+    cmd := &cobra.Command{
+        Use:   "delete",
+        Short: "Permanently delete a user",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            if !force {
+                fmt.Printf("Pass --force to confirm deletion of %q\n", username)
+                return nil
+            }
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            if err := m.Users.Delete(username); err != nil { return err }
+            fmt.Printf("✓ User %q deleted\n", username)
+            return nil
+        },
+    }
+    cmd.Flags().StringVarP(&username, "username", "u", "", "Username (required)")
+    cmd.Flags().BoolVar(&force, "force", false, "Confirm permanent deletion")
+    cmd.MarkFlagRequired("username")
+    return cmd
+}
+
+func authCmdSessionList(dbPath *string) *cobra.Command {
+    return &cobra.Command{
+        Use:   "list",
+        Short: "List active sessions",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            sessions, err := m.ListSessions()
+            if err != nil { return err }
+            if len(sessions) == 0 { fmt.Println("No active sessions."); return nil }
+            tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+            fmt.Fprintln(tw, "TOKEN (prefix)\tEXPIRES")
+            fmt.Fprintln(tw, "-------------\t-------")
+            for _, s := range sessions {
+                tok := s.Token
+                if len(tok) > 16 { tok = tok[:16] + "…" }
+                fmt.Fprintf(tw, "%s\t%s\n", tok, s.Expiry.Format("2006-01-02 15:04:05"))
+            }
+            tw.Flush()
+            return nil
+        },
+    }
+}
+
+func authCmdSessionPurge(dbPath *string) *cobra.Command {
+    return &cobra.Command{
+        Use:   "purge",
+        Short: "Delete all expired sessions",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            m, err := authOpen(dbPath)
+            if err != nil { return err }
+            defer m.Close()
+            n, err := m.PurgeSessions()
+            if err != nil { return err }
+            fmt.Printf("✓ Purged %d expired session(s)\n", n)
+            return nil
+        },
+    }
+}
+```
+
+Usage after embedding:
+
+```bash
+myapp auth user add -u chris -r admin
+myapp auth user list
+myapp auth user passwd -u chris
+myapp auth user roles -u chris -r admin,viewer
+myapp auth user deactivate -u someuser
+myapp auth user activate   -u someuser
+myapp auth user delete -u someuser --force
+myapp auth session list
+myapp auth session purge
+myapp auth --db /other/path.db user list   # override default db path
+```
+
+---
+
+## Standalone CLI
+
+If you prefer a separate binary (requires Go on the target machine):
+
+```bash
+go install github.com/chrismfz/goauth/cmd/goauth@latest
+```
+
+Same commands as above but prefixed with `goauth --db /path/to/auth.db`.
+For servers without Go, prefer the embedded CLI and cross-compile it
+alongside your service binary.
+
+---
+
+## Configuration reference
 
 | Field | Default | Description |
 |---|---|---|
@@ -129,19 +711,22 @@ goauth --db /etc/cfm/auth.db session purge
 | `SessionTTL` | `8h` | Absolute session lifetime |
 | `IdleTimeout` | `30m` | Inactivity expiry (0 = disabled) |
 | `CookieName` | `__Host-sid` | Cookie name (`__Host-` forces Secure + Path=/) |
-| `SecureCookie` | `false` | Set `Secure` flag (enable in production) |
+| `SecureCookie` | `false` | Set `Secure` flag (required in production over HTTPS) |
 | `SameSite` | `Strict` | `SameSite` cookie attribute |
 | `LoginPath` | `/login` | Redirect target for unauthenticated browser requests |
-| `OnAuthFailure` | `nil` | Custom handler called on 401/403 (overrides redirect) |
+| `OnAuthFailure` | `nil` | Custom handler called on 401/403 (overrides default behaviour) |
+
+**Cookie name note:** `__Host-` prefix enforces `Secure=true`, `Path=/`, and
+no `Domain` at the browser level. Requires `SecureCookie: true`. Use a plain
+name (e.g. `myapp-sid`) when running over HTTP locally.
 
 ---
 
-## Database Schema
+## Database schema
 
 Two tables are created automatically on first run:
 
 ```sql
--- User accounts
 CREATE TABLE users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
@@ -152,7 +737,6 @@ CREATE TABLE users (
     updated_at    INTEGER NOT NULL
 );
 
--- SCS session store
 CREATE TABLE sessions (
     token  TEXT    PRIMARY KEY,
     data   BLOB    NOT NULL,
@@ -162,10 +746,24 @@ CREATE TABLE sessions (
 
 ---
 
+## Deployment checklist
+
+- [ ] `auth.db_path` configured
+- [ ] `secure_cookie: true` in production (HTTPS)
+- [ ] Cookie name: plain name for HTTP, `__Host-` prefix for HTTPS
+- [ ] nginx: `auth_basic` removed, `X-Forwarded-For` header forwarded
+- [ ] First user created: `myapp auth user add -u admin -r admin`
+- [ ] `WithAuth` uses `realIPAllowed` not `r.RemoteAddr` / `ipAllowed`
+- [ ] `WithMainIPOnly` uses `realIPAllowed` not `r.RemoteAddr` / `ipAllowed`
+- [ ] `/login` and `/logout` registered without any auth guard
+- [ ] `Auth.LoadAndSave()` is the outermost wrapper around the entire mux
+
+---
+
 ## Roadmap
 
-- [ ] `golang.org/x/term` for proper no-echo password prompts in CLI
 - [ ] TOTP / 2FA support
 - [ ] Login attempt audit log
 - [ ] Rate limiting on `/login`
 - [ ] `session kill <token>` CLI command
+- [ ] `user import` from htpasswd (migration helper)
