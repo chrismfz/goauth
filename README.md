@@ -33,11 +33,12 @@ import "github.com/chrismfz/goauth"
 
 func main() {
     auth, err := goauth.New(goauth.Config{
-        DBPath:       "/etc/myapp/auth.db",
-        SessionTTL:   8 * time.Hour,
-        IdleTimeout:  30 * time.Minute,
-        CookieName:   "__Host-sid",
-        SecureCookie: true,
+        DBPath:        "/etc/myapp/auth.db",      // users + auth_log
+        SessionDBPath: "/etc/myapp/sessions.db",  // optional; defaults to DBPath
+        SessionTTL:    8 * time.Hour,
+        IdleTimeout:   30 * time.Minute,
+        CookieName:    "__Host-sid",
+        SecureCookie:  true,
     })
     if err != nil {
         log.Fatal(err)
@@ -60,6 +61,22 @@ func main() {
     log.Fatal(http.ListenAndServe(":8080", auth.LoadAndSave(mux)))
 }
 ```
+
+### Reducing SQLite lock contention (no external dependencies)
+
+If you run goauth in high-concurrency environments and want to stay fully
+embedded (no Redis/Memcached), use a separate SQLite file for sessions:
+
+```go
+auth, err := goauth.New(goauth.Config{
+    DBPath:        "/var/lib/myapp/auth.db",      // users + auth_log
+    SessionDBPath: "/var/lib/myapp/sessions.db",  // sessions only
+})
+```
+
+This isolates high-churn session writes from user/audit tables and reduces
+`SQLITE_BUSY` contention. If `SessionDBPath` is empty, goauth keeps the
+original single-file behavior.
 
 ### Reading the current user in handlers
 
@@ -960,4 +977,3 @@ CREATE TABLE auth_log (
       Migration path between backends:
 	argus auth migrate export --format json > users.json
 	argus auth migrate import --format json < users.json
-

@@ -7,7 +7,9 @@ package goauth
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -17,8 +19,13 @@ import (
 // Config holds all options for a Manager instance.
 type Config struct {
 	// DBPath is the path to the SQLite database file.
-	// Both the user table and the session table live here.
+	// User and auth_log tables live here. Sessions also live here when
+	// SessionDBPath is not set.
 	DBPath string
+
+	// SessionDBPath optionally stores sessions in a separate SQLite file.
+	// If empty, sessions share DBPath.
+	SessionDBPath string
 
 	// SessionTTL is the absolute lifetime of a session (default: 8h).
 	SessionTTL time.Duration
@@ -56,12 +63,12 @@ func (c *Config) withDefaults() {
 		c.SessionTTL = 8 * time.Hour
 	}
 
-//	if c.IdleTimeout == 0 {
-//		c.IdleTimeout = 30 * time.Minute
-//	}
-// IdleTimeout intentionally has no default — leaving it at 0 disables it.
-// When enabled, scs commits the session on every request to update last-access,
-// causing SQLITE_BUSY storms under concurrent load.
+	//	if c.IdleTimeout == 0 {
+	//		c.IdleTimeout = 30 * time.Minute
+	//	}
+	// IdleTimeout intentionally has no default — leaving it at 0 disables it.
+	// When enabled, scs commits the session on every request to update last-access,
+	// causing SQLITE_BUSY storms under concurrent load.
 
 	if c.CookieName == "" {
 		c.CookieName = "__Host-sid"
@@ -76,40 +83,46 @@ func (c *Config) withDefaults() {
 
 // Manager is the central auth object. Create one per project and share it.
 type Manager struct {
-	cfg     Config
-	db      *sql.DB
-	Users   *UserStore
-	session *scs.SessionManager
-	rl      *loginRateLimiter
+	cfg       Config
+	db        *sql.DB
+	sessionDB *sql.DB
+	Users     *UserStore
+	session   *scs.SessionManager
+	rl        *loginRateLimiter
 }
 
-// New opens (or creates) the SQLite database at cfg.DBPath, runs schema
-// migrations, and returns a ready-to-use Manager.
+// New opens (or creates) SQLite databases, runs schema migrations, and
+// returns a ready-to-use Manager.
 func New(cfg Config) (*Manager, error) {
 	cfg.withDefaults()
 
-	db, err := sql.Open("sqlite", cfg.DBPath)
+	db, err := openSQLiteDB(cfg.DBPath)
 	if err != nil {
-		return nil, fmt.Errorf("goauth: open db: %w", err)
+		return nil, fmt.Errorf("goauth: open auth db: %w", err)
 	}
 
-	// SQLite connection pragmas for safety and performance.
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
+	if err := runAuthMigrations(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("goauth: auth migrations: %w", err)
 	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("goauth: pragma %q: %w", p, err)
+
+	sessionDB := db
+	if cfg.SessionDBPath != "" && cfg.SessionDBPath != cfg.DBPath {
+		sessionDB, err = openSQLiteDB(cfg.SessionDBPath)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("goauth: open session db: %w", err)
 		}
 	}
-
-	if err := runMigrations(db); err != nil {
-		return nil, fmt.Errorf("goauth: migrations: %w", err)
+	if err := runSessionMigrations(sessionDB); err != nil {
+		if sessionDB != db {
+			_ = sessionDB.Close()
+		}
+		_ = db.Close()
+		return nil, fmt.Errorf("goauth: session migrations: %w", err)
 	}
 
-	store := newSQLiteSessionStore(db)
+	store := newSQLiteSessionStore(sessionDB)
 
 	sm := scs.New()
 	sm.Store = store
@@ -121,26 +134,77 @@ func New(cfg Config) (*Manager, error) {
 	sm.Cookie.SameSite = cfg.SameSite
 	sm.Cookie.Path = "/"
 
-// Don't let session commit failures return 500 to the client.
-// The request still succeeds; the session just won't be extended this tick.
-sm.ErrorFunc = func(w http.ResponseWriter, r *http.Request, err error) {
-    // log but do not write an error response — the handler already responded
-    _ = err
-}
-
+	// Don't let session commit failures return 500 to the client.
+	// The request still succeeds; the session just won't be extended this tick.
+	sm.ErrorFunc = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("goauth/store: commit: %v", err)
+	}
 
 	m := &Manager{
-		cfg:     cfg,
-		db:      db,
-		Users:   &UserStore{db: db},
-		session: sm,
-		rl:      newLoginRateLimiter(),
+		cfg:       cfg,
+		db:        db,
+		sessionDB: sessionDB,
+		Users:     &UserStore{db: db},
+		session:   sm,
+		rl:        newLoginRateLimiter(),
 	}
 	return m, nil
 }
 
+func openSQLiteDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("goauth: pragma %q: %w", "PRAGMA busy_timeout=5000", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("goauth: pragma %q: %w", "PRAGMA foreign_keys=ON", err)
+	}
+	if err := enableWALWithRetry(db, 10, 200*time.Millisecond); err != nil {
+		log.Printf("goauth: warning: %v (continuing without forcing WAL)", err)
+	}
+
+	return db, nil
+}
+
+func enableWALWithRetry(db *sql.DB, attempts int, delay time.Duration) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !isSQLiteLockError(err) {
+				return fmt.Errorf("goauth: pragma %q: %w", "PRAGMA journal_mode=WAL", err)
+			}
+			time.Sleep(delay)
+		}
+	}
+	return fmt.Errorf("goauth: pragma %q: %w", "PRAGMA journal_mode=WAL", lastErr)
+}
+
+func isSQLiteLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy")
+}
+
 // Close releases the database handle. Call this on graceful shutdown.
 func (m *Manager) Close() error {
+	if m.sessionDB != nil && m.sessionDB != m.db {
+		if err := m.sessionDB.Close(); err != nil {
+			return err
+		}
+	}
 	return m.db.Close()
 }
 
