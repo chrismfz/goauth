@@ -192,7 +192,14 @@ func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
 			}
 		}
 
-		codes, err := m.Users.GenerateRecoveryCodes(user.Username, DefaultRecoveryCodeCount)
+		auditCtx := AdminAuditContext{
+			Actor:  user.Username,
+			Target: user.Username,
+			IP:     clientIP(r),
+			Host:   r.Host,
+			Reason: "self_service",
+		}
+		codes, err := m.AdminRotateRecoveryCodes(auditCtx, DefaultRecoveryCodeCount)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
@@ -241,7 +248,14 @@ func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
 			return
 		}
 
-		enrollment, err := m.Users.BeginTOTPEnrollment(user.Username, m.cfg.MFAIssuer, m.mfaKey)
+		auditCtx := AdminAuditContext{
+			Actor:  user.Username,
+			Target: user.Username,
+			IP:     clientIP(r),
+			Host:   r.Host,
+			Reason: "self_service",
+		}
+		enrollment, err := m.AdminBeginTOTPEnrollment(auditCtx)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
@@ -278,21 +292,28 @@ func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
 			return
 		}
 
-		ok, pending, err := m.Users.VerifyTOTPEnrollment(user.Username, req.Code, m.mfaKey)
+		auditCtx := AdminAuditContext{
+			Actor:  user.Username,
+			Target: user.Username,
+			IP:     clientIP(r),
+			Host:   r.Host,
+			Reason: "self_service",
+		}
+		err := m.AdminConfirmTOTPEnrollment(auditCtx, req.Code)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 				return
 			}
+			if errors.Is(err, errMFANoPending) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no pending TOTP enrollment"})
+				return
+			}
+			if errors.Is(err, errMFAVerifyFailed) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid TOTP code"})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not enable TOTP MFA"})
-			return
-		}
-		if !pending {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no pending TOTP enrollment"})
-			return
-		}
-		if !ok {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid TOTP code"})
 			return
 		}
 		m.writeMFAProof(r)
@@ -334,7 +355,14 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 			}
 		}
 
-		if err := m.Users.DisableMFA(user.Username); err != nil {
+		auditCtx := AdminAuditContext{
+			Actor:  user.Username,
+			Target: user.Username,
+			IP:     clientIP(r),
+			Host:   r.Host,
+			Reason: "self_service",
+		}
+		if err := m.AdminDisableMFA(auditCtx); err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 				return

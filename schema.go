@@ -30,7 +30,11 @@ func runAuthMigrations(db *sql.DB) error {
 			event    TEXT    NOT NULL,
 			username TEXT    NOT NULL DEFAULT '',
 			ip       TEXT    NOT NULL DEFAULT '',
-			reason   TEXT    NOT NULL DEFAULT ''
+			reason   TEXT    NOT NULL DEFAULT '',
+			actor    TEXT    NOT NULL DEFAULT '',
+			target   TEXT    NOT NULL DEFAULT '',
+			host     TEXT    NOT NULL DEFAULT '',
+			ticket   TEXT    NOT NULL DEFAULT ''
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS auth_log_ts_idx ON auth_log(ts)`,
@@ -82,6 +86,13 @@ func runAuthMigrations(db *sql.DB) error {
 			created_at     INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS webauthn_challenges_expires_idx ON webauthn_challenges(expires_at)`,
+		`ALTER TABLE auth_log ADD COLUMN actor TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE auth_log ADD COLUMN target TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE auth_log ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE auth_log ADD COLUMN ticket TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS auth_log_event_ts_idx ON auth_log(event, ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS auth_log_actor_ts_idx ON auth_log(actor, ts DESC)`,
+		`CREATE INDEX IF NOT EXISTS auth_log_target_ts_idx ON auth_log(target, ts DESC)`,
 	}
 
 	for _, s := range additiveStmts {

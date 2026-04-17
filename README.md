@@ -780,8 +780,10 @@ myapp auth --db /other/path.db user list   # override default db path
 Recommended MFA support commands to add under `myapp auth mfa`:
 
 ```bash
-myapp auth mfa recovery-regenerate -u chris   # preferred recovery action
-myapp auth mfa reset -u chris                 # fallback / break-glass action
+myapp auth mfa recovery-regenerate -u chris \
+  --actor admin --source-ip 10.0.0.15 --source-host argus-01 --reason "lost phone" --ticket INC-4821
+myapp auth mfa reset -u chris \
+  --actor admin --source-ip 10.0.0.15 --source-host cfm-02 --reason "break-glass" --ticket CHG-991
 ```
 
 Do **not** add a normal-operations command that outputs live TOTP values from
@@ -851,6 +853,18 @@ Every login attempt is written to the `auth_log` SQLite table:
 | `RATELIMIT` | `too_many_attempts_ip` | IP limit exceeded |
 | `RATELIMIT` | `too_many_attempts_user` | username limit exceeded |
 
+MFA admin and operator actions are also written to `auth_log`:
+
+| event | meaning |
+|---|---|
+| `MFA_ENABLE_INIT` | TOTP enrollment started for target user |
+| `MFA_ENABLE_CONFIRM` | TOTP enrollment confirmed for target user |
+| `MFA_DISABLE` | MFA disabled for target user |
+| `MFA_RESET` | MFA reset (factors/challenges cleared) for target user |
+| `MFA_RECOVERY_ROTATE` | Recovery codes rotated for target user |
+
+For MFA events, metadata is captured in `actor`, `target`, `host`, `ip`, `reason`, and `ticket`.
+
 ### Querying from Go
 
 ```go
@@ -859,6 +873,13 @@ entries, err := auth.QueryAuthLog(100)
 
 // Filter by IP
 entries, err := auth.QueryAuthLogByIP("5.5.5.5", 50)
+
+// MFA admin events with optional filters (actor/target/host/ip)
+entries, err := auth.QueryAuthLogMFAAdmin(goauth.MFAAdminQueryFilter{
+    Actor: "admin",
+    Host:  "argus-01",
+    Limit: 200,
+})
 
 // Purge entries older than 90 days
 n, err := auth.PurgeAuthLog(90 * 24 * time.Hour)
@@ -1009,10 +1030,14 @@ CREATE TABLE sessions (
 CREATE TABLE auth_log (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       INTEGER NOT NULL,
-    event    TEXT    NOT NULL,  -- SUCCESS | FAIL | RATELIMIT
+    event    TEXT    NOT NULL,  -- SUCCESS | FAIL | RATELIMIT | MFA_*
     username TEXT    NOT NULL DEFAULT '',
     ip       TEXT    NOT NULL DEFAULT '',
-    reason   TEXT    NOT NULL DEFAULT ''  -- bad_credentials | user_inactive | too_many_attempts_ip | too_many_attempts_user
+    reason   TEXT    NOT NULL DEFAULT '', -- reason or operational context
+    actor    TEXT    NOT NULL DEFAULT '', -- admin/operator username for MFA events
+    target   TEXT    NOT NULL DEFAULT '', -- user account impacted by MFA event
+    host     TEXT    NOT NULL DEFAULT '', -- source host (e.g. argus-01, cfm-02)
+    ticket   TEXT    NOT NULL DEFAULT ''  -- ticket/change reference
 );
 ```
 
