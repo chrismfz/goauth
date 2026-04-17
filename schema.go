@@ -42,6 +42,28 @@ func runAuthMigrations(db *sql.DB) error {
 			return err
 		}
 	}
+
+	additiveStmts := []string{
+		`ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN mfa_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN totp_secret_enc TEXT`,
+		`ALTER TABLE users ADD COLUMN totp_verified_at INTEGER`,
+		`CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id    INTEGER NOT NULL,
+			code_hash  TEXT    NOT NULL,
+			created_at INTEGER NOT NULL,
+			UNIQUE(user_id, code_hash),
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS mfa_recovery_codes_user_id_idx ON mfa_recovery_codes(user_id)`,
+	}
+
+	for _, s := range additiveStmts {
+		if _, err := db.Exec(s); err != nil && !isDuplicateColumnErr(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -62,4 +84,11 @@ func runSessionMigrations(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func isDuplicateColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return containsAny(err.Error(), "duplicate column name")
 }
