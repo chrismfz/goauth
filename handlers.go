@@ -34,7 +34,6 @@ type mfaDisableRequest struct {
 const mfaProofWindow = 10 * time.Minute
 
 const (
-	recoveryCodeCount               = 10
 	recoveryCodeRegenerateThreshold = 2
 )
 
@@ -193,7 +192,7 @@ func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
 			}
 		}
 
-		codes, err := m.Users.GenerateRecoveryCodes(user.Username, recoveryCodeCount)
+		codes, err := m.Users.GenerateRecoveryCodes(user.Username, DefaultRecoveryCodeCount)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
@@ -242,33 +241,20 @@ func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
 			return
 		}
 
-		key, err := totp.Generate(totp.GenerateOpts{
-			Issuer:      m.cfg.MFAIssuer,
-			AccountName: user.Username,
-		})
+		enrollment, err := m.Users.BeginTOTPEnrollment(user.Username, m.cfg.MFAIssuer, m.mfaKey)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not generate TOTP secret"})
-			return
-		}
-
-		enc, err := encryptSecret(key.Secret(), m.mfaKey)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not protect TOTP secret"})
-			return
-		}
-		if err := m.Users.SetTOTPSecretUnverified(user.Username, enc); err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 				return
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store TOTP secret"})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not generate TOTP secret"})
 			return
 		}
 
 		writeJSON(w, http.StatusOK, map[string]string{
-			"issuer":      m.cfg.MFAIssuer,
-			"account":     user.Username,
-			"otpauth_uri": key.URL(),
+			"issuer":      enrollment.Issuer,
+			"account":     enrollment.Account,
+			"otpauth_uri": enrollment.OTPAuthURI,
 		})
 	}
 }
@@ -292,35 +278,21 @@ func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
 			return
 		}
 
-		enc, err := m.Users.GetTOTPSecret(user.Username)
+		ok, pending, err := m.Users.VerifyTOTPEnrollment(user.Username, req.Code, m.mfaKey)
 		if err != nil {
-			if errors.Is(err, ErrUserNotFound) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read TOTP secret"})
-			return
-		}
-		if enc == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no pending TOTP enrollment"})
-			return
-		}
-
-		secret, err := decryptSecret(enc, m.mfaKey)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read TOTP secret"})
-			return
-		}
-		if !totp.Validate(normalizeMFACode(req.Code), secret) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid TOTP code"})
-			return
-		}
-		if err := m.Users.ConfirmTOTP(user.Username); err != nil {
 			if errors.Is(err, ErrUserNotFound) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 				return
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not enable TOTP MFA"})
+			return
+		}
+		if !pending {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no pending TOTP enrollment"})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid TOTP code"})
 			return
 		}
 		m.writeMFAProof(r)
