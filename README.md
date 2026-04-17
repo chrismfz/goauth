@@ -49,11 +49,15 @@ func main() {
 
     // Public auth endpoints
     mux.HandleFunc("POST /login",  auth.LoginHandler())
+    mux.HandleFunc("POST /login/webauthn/begin", auth.WebAuthnLoginBeginHandler())
+    mux.HandleFunc("POST /login/webauthn/finish", auth.WebAuthnLoginFinishHandler())
     mux.HandleFunc("POST /login/mfa/verify", auth.LoginMFAVerifyHandler())
     mux.HandleFunc("POST /logout", auth.LogoutHandler())
     mux.HandleFunc("GET /me",      auth.Require()(auth.MeHandler()))
     mux.HandleFunc("POST /mfa/totp/enroll/start", auth.Require()(auth.TOTPEnrollStartHandler()))
     mux.HandleFunc("POST /mfa/totp/enroll/confirm", auth.Require()(auth.TOTPEnrollConfirmHandler()))
+    mux.HandleFunc("POST /mfa/webauthn/register/begin", auth.Require()(auth.WebAuthnRegistrationBeginHandler()))
+    mux.HandleFunc("POST /mfa/webauthn/register/finish", auth.Require()(auth.WebAuthnRegistrationFinishHandler()))
     mux.HandleFunc("POST /mfa/recovery/regenerate", auth.Require()(auth.MFARecoveryRegenerateHandler()))
     mux.HandleFunc("POST /mfa/disable", auth.Require()(auth.MFADisableHandler()))
 
@@ -76,6 +80,8 @@ embedded (no Redis/Memcached), use a separate SQLite file for sessions:
 auth, err := goauth.New(goauth.Config{
     DBPath:        "/var/lib/myapp/auth.db",      // users + auth_log
     SessionDBPath: "/var/lib/myapp/sessions.db",  // sessions only
+    WebAuthnRPID:  "example.com",
+    WebAuthnOrigins: []string{"https://app.example.com"},
 })
 ```
 
@@ -115,6 +121,20 @@ When MFA is enabled, `/login` responds with:
 ```json
 { "mfa_required": true, "methods": ["totp", "recovery_code"] }
 ```
+
+Users configured with `mfa_type=passkey` can complete second factor using:
+
+1. `POST /login/webauthn/begin` (while MFA is pending from `/login`)
+2. `POST /login/webauthn/finish` (assertion response body)
+
+For passwordless/passkey-first users (`mfa_enabled=1`, `mfa_type=passkey`), start with:
+
+```json
+POST /login/webauthn/begin
+{ "username": "chris" }
+```
+
+then finish using `/login/webauthn/finish`.
 
 Complete MFA with `POST /login/mfa/verify`:
 
