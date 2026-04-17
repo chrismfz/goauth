@@ -1,7 +1,9 @@
 package goauth
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,20 +14,23 @@ import (
 
 // Sentinel errors returned by UserStore operations.
 var (
-	ErrUserNotFound    = errors.New("goauth: user not found")
-	ErrUserExists      = errors.New("goauth: username already exists")
-	ErrUserInactive    = errors.New("goauth: user account is inactive")
-	ErrBadCredentials  = errors.New("goauth: invalid username or password")
+	ErrUserNotFound   = errors.New("goauth: user not found")
+	ErrUserExists     = errors.New("goauth: username already exists")
+	ErrUserInactive   = errors.New("goauth: user account is inactive")
+	ErrBadCredentials = errors.New("goauth: invalid username or password")
 )
 
 // User represents a stored user account.
 type User struct {
-	ID        int64
-	Username  string
-	Roles     []string
-	Active    bool
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID             int64
+	Username       string
+	Roles          []string
+	Active         bool
+	MFAEnabled     bool
+	MFAType        string
+	TOTPVerifiedAt *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // HasRole reports whether the user holds the given role.
@@ -134,12 +139,71 @@ func (s *UserStore) Delete(username string) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
+// EnableTOTP enables TOTP MFA for the given user and stores the encrypted secret.
+func (s *UserStore) EnableTOTP(username, encryptedSecret string) error {
+	now := time.Now().Unix()
+	res, err := s.db.Exec(
+		`UPDATE users
+		 SET mfa_enabled=1, mfa_type='totp', totp_secret_enc=?, totp_verified_at=?, updated_at=?
+		 WHERE username=? COLLATE NOCASE`,
+		encryptedSecret, now, now, username,
+	)
+	if err != nil {
+		return fmt.Errorf("goauth: enable totp: %w", err)
+	}
+	return requireOneRow(res, ErrUserNotFound)
+}
+
+// DisableMFA disables all MFA factors for the given user.
+func (s *UserStore) DisableMFA(username string) error {
+	res, err := s.db.Exec(
+		`UPDATE users
+		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
+		 WHERE username=? COLLATE NOCASE`,
+		time.Now().Unix(), username,
+	)
+	if err != nil {
+		return fmt.Errorf("goauth: disable mfa: %w", err)
+	}
+	return requireOneRow(res, ErrUserNotFound)
+}
+
+// ConsumeRecoveryCode deletes a single matching MFA recovery code hash for a user.
+// It returns true only when a matching code existed and was consumed.
+func (s *UserStore) ConsumeRecoveryCode(username, code string) (bool, error) {
+	var userID int64
+	if err := s.db.QueryRow(
+		`SELECT id FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&userID); errors.Is(err, sql.ErrNoRows) {
+		return false, ErrUserNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+
+	sum := sha256.Sum256([]byte(code))
+	codeHash := hex.EncodeToString(sum[:])
+	res, err := s.db.Exec(
+		`DELETE FROM mfa_recovery_codes
+		 WHERE user_id=? AND code_hash=?`,
+		userID, codeHash,
+	)
+	if err != nil {
+		return false, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // --- Read operations ---
 
 // GetByUsername fetches a user by username (case-insensitive).
 func (s *UserStore) GetByUsername(username string) (*User, error) {
 	row := s.db.QueryRow(
-		`SELECT id, username, roles, active, created_at, updated_at
+		`SELECT id, username, roles, active, mfa_enabled, mfa_type, totp_verified_at, created_at, updated_at
 		 FROM users WHERE username=? COLLATE NOCASE`,
 		username,
 	)
@@ -149,7 +213,7 @@ func (s *UserStore) GetByUsername(username string) (*User, error) {
 // List returns all users ordered by username.
 func (s *UserStore) List() ([]*User, error) {
 	rows, err := s.db.Query(
-		`SELECT id, username, roles, active, created_at, updated_at
+		`SELECT id, username, roles, active, mfa_enabled, mfa_type, totp_verified_at, created_at, updated_at
 		 FROM users ORDER BY username COLLATE NOCASE`,
 	)
 	if err != nil {
@@ -172,19 +236,21 @@ func (s *UserStore) List() ([]*User, error) {
 // Returns ErrBadCredentials for wrong password, ErrUserInactive for disabled accounts.
 func (s *UserStore) Authenticate(username, password string) (*User, error) {
 	row := s.db.QueryRow(
-		`SELECT id, username, password_hash, roles, active, created_at, updated_at
+		`SELECT id, username, password_hash, roles, active, mfa_enabled, mfa_type, totp_verified_at, created_at, updated_at
 		 FROM users WHERE username=? COLLATE NOCASE`,
 		username,
 	)
 
 	var (
-		u    User
-		hash string
-		roles string
-		active int
+		u                    User
+		hash                 string
+		roles                string
+		active               int
+		mfaEnabled           int
+		totpVerifiedAt       sql.NullInt64
 		createdAt, updatedAt int64
 	)
-	err := row.Scan(&u.ID, &u.Username, &hash, &roles, &active, &createdAt, &updatedAt)
+	err := row.Scan(&u.ID, &u.Username, &hash, &roles, &active, &mfaEnabled, &u.MFAType, &totpVerifiedAt, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Perform a dummy hash to prevent timing-based username enumeration.
 		argon2id.ComparePasswordAndHash(password, "$argon2id$v=19$m=65536,t=3,p=2$dummysaltdummysalt$dummyhash")
@@ -207,6 +273,11 @@ func (s *UserStore) Authenticate(username, password string) (*User, error) {
 		u.Roles = []string{}
 	}
 	u.Active = true
+	u.MFAEnabled = mfaEnabled == 1
+	if totpVerifiedAt.Valid {
+		t := time.Unix(totpVerifiedAt.Int64, 0)
+		u.TOTPVerifiedAt = &t
+	}
 	u.CreatedAt = time.Unix(createdAt, 0)
 	u.UpdatedAt = time.Unix(updatedAt, 0)
 	return &u, nil
@@ -220,12 +291,14 @@ type scanner interface {
 
 func scanUser(s scanner) (*User, error) {
 	var (
-		u         User
-		active    int
-		rolesJSON string
+		u                    User
+		active               int
+		mfaEnabled           int
+		rolesJSON            string
+		totpVerifiedAt       sql.NullInt64
 		createdAt, updatedAt int64
 	)
-	err := s.Scan(&u.ID, &u.Username, &rolesJSON, &active, &createdAt, &updatedAt)
+	err := s.Scan(&u.ID, &u.Username, &rolesJSON, &active, &mfaEnabled, &u.MFAType, &totpVerifiedAt, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -236,6 +309,11 @@ func scanUser(s scanner) (*User, error) {
 		u.Roles = []string{}
 	}
 	u.Active = active == 1
+	u.MFAEnabled = mfaEnabled == 1
+	if totpVerifiedAt.Valid {
+		t := time.Unix(totpVerifiedAt.Int64, 0)
+		u.TOTPVerifiedAt = &t
+	}
 	u.CreatedAt = time.Unix(createdAt, 0)
 	u.UpdatedAt = time.Unix(updatedAt, 0)
 	return &u, nil
