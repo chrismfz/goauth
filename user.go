@@ -200,6 +200,25 @@ func (s *UserStore) ConsumeRecoveryCode(username, code string) (bool, error) {
 
 // --- Read operations ---
 
+// GetTOTPSecret fetches the stored TOTP secret for a user.
+func (s *UserStore) GetTOTPSecret(username string) (string, error) {
+	var secret sql.NullString
+	err := s.db.QueryRow(
+		`SELECT totp_secret_enc FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&secret)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrUserNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("goauth: get totp secret: %w", err)
+	}
+	if !secret.Valid {
+		return "", nil
+	}
+	return secret.String, nil
+}
+
 // GetByUsername fetches a user by username (case-insensitive).
 func (s *UserStore) GetByUsername(username string) (*User, error) {
 	row := s.db.QueryRow(
