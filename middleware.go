@@ -15,8 +15,10 @@ const (
 
 // sessionUsernameKey and sessionRolesKey are the keys used inside the scs session.
 const (
-	sessionUsernameKey = "goauth.username"
-	sessionRolesKey    = "goauth.roles"
+	sessionUsernameKey           = "goauth.username"
+	sessionRolesKey              = "goauth.roles"
+	sessionMFAPendingUserKey     = "goauth.mfa_pending_user"
+	sessionMFAPendingDeadlineKey = "goauth.mfa_deadline"
 )
 
 // UserFromContext retrieves the authenticated User from the request context.

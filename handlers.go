@@ -7,12 +7,19 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/pquerna/otp/totp"
 )
 
 // loginRequest is the JSON body expected by LoginHandler.
 type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+// loginMFAVerifyRequest is the JSON body expected by LoginMFAVerifyHandler.
+type loginMFAVerifyRequest struct {
+	Code string `json:"code"`
 }
 
 // clientIP extracts the real client IP for audit logging and rate limiting.
@@ -35,6 +42,49 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func mfaMethods(user *User) []string {
+	methods := []string{"recovery_code"}
+	if strings.EqualFold(user.MFAType, "totp") {
+		methods = append([]string{"totp"}, methods...)
+	} else if user.MFAType != "" {
+		methods = append([]string{user.MFAType}, methods...)
+	}
+	return methods
+}
+
+func normalizeMFACode(code string) string {
+	code = strings.TrimSpace(code)
+	code = strings.ReplaceAll(code, " ", "")
+	code = strings.ReplaceAll(code, "-", "")
+	return code
+}
+
+func (m *Manager) verifyMFA(username, code string) (bool, error) {
+	code = normalizeMFACode(code)
+	if code == "" {
+		return false, nil
+	}
+
+	encryptedSecret, err := m.Users.GetTOTPSecret(username)
+	if err != nil && !errors.Is(err, ErrUserNotFound) {
+		return false, err
+	}
+	if err == nil && encryptedSecret != "" {
+		if totp.Validate(code, encryptedSecret) {
+			return true, nil
+		}
+	}
+
+	consumed, err := m.Users.ConsumeRecoveryCode(username, code)
+	if errors.Is(err, ErrUserNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return consumed, nil
+}
+
 // LoginHandler returns an http.Handler that accepts POST requests with
 // JSON credentials and establishes an authenticated session on success.
 //
@@ -44,6 +94,7 @@ func clientIP(r *http.Request) string {
 //   - Session token rotation on login (prevents session fixation)
 //
 // On success:  200 {"username":"...","roles":[...]}
+// On MFA:      200 {"mfa_required":true,"methods":[...]}
 // On failure:  401 {"error":"invalid username or password"}
 // On locked:   429 {"error":"too many attempts"} + Retry-After header
 func (m *Manager) LoginHandler() http.HandlerFunc {
@@ -96,6 +147,18 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 			return
 		}
 
+		if user.MFAEnabled {
+			deadline := time.Now().Add(5 * time.Minute)
+			m.session.Put(r.Context(), sessionMFAPendingUserKey, user.Username)
+			m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, deadline.Format(time.RFC3339Nano))
+			auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_pending")
+			writeJSON(w, http.StatusOK, map[string]any{
+				"mfa_required": true,
+				"methods":      mfaMethods(user),
+			})
+			return
+		}
+
 		// ── Session ───────────────────────────────────────────────────────────
 		// Rotate session ID on login to prevent session fixation.
 		if err := m.session.RenewToken(r.Context()); err != nil {
@@ -106,8 +169,119 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 		rolesJSON, _ := json.Marshal(user.Roles)
 		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
 		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
+		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
 
 		auditLog(m.db, LogEventSuccess, user.Username, ip, "")
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"username": user.Username,
+			"roles":    user.Roles,
+		})
+	}
+}
+
+// LoginMFAVerifyHandler verifies an MFA code for a pending login session.
+//
+// Accepts POST /login/mfa/verify with JSON body: {"code":"123456"}
+//
+// On success:  200 {"username":"...","roles":[...]}
+// On failure:  401 {"error":"invalid MFA code"}
+// On locked:   429 {"error":"too many MFA attempts"} + Retry-After header
+func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ip := clientIP(r)
+		username := m.session.GetString(r.Context(), sessionMFAPendingUserKey)
+		if username == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no pending MFA challenge"})
+			return
+		}
+
+		deadlineRaw := m.session.GetString(r.Context(), sessionMFAPendingDeadlineKey)
+		if deadlineRaw == "" {
+			m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no pending MFA challenge"})
+			return
+		}
+		deadline, err := time.Parse(time.RFC3339Nano, deadlineRaw)
+		if err != nil || time.Now().After(deadline) {
+			m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+			m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+			return
+		}
+
+		var req loginMFAVerifyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
+			reason := LogReasonTooManyIP
+			if username != "" {
+				reason = LogReasonTooManyUser
+			}
+			auditLog(m.db, LogEventRateLimit, username, ip, reason)
+			secs := int(retryAfter / time.Second)
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error": "too many MFA attempts — please wait before trying again",
+			})
+			return
+		}
+
+		ok, err := m.verifyMFA(username, req.Code)
+		if err != nil {
+			auditLog(m.db, LogEventFail, username, ip, "mfa_internal_error")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if !ok {
+			auditLog(m.db, LogEventFail, username, ip, "mfa_invalid_code")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid MFA code"})
+			return
+		}
+
+		user, err := m.Users.GetByUsername(username)
+		if err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+				m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid MFA session"})
+				return
+			}
+			auditLog(m.db, LogEventFail, username, ip, "mfa_internal_error")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if !user.Active {
+			m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+			m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+			auditLog(m.db, LogEventFail, username, ip, LogReasonUserInactive)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "account is disabled"})
+			return
+		}
+
+		if err := m.session.RenewToken(r.Context()); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
+			return
+		}
+
+		rolesJSON, _ := json.Marshal(user.Roles)
+		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
+		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
+		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+		auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_verified")
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"username": user.Username,
