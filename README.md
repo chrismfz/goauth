@@ -53,13 +53,8 @@ func main() {
     mux.HandleFunc("POST /login/webauthn/finish", auth.WebAuthnLoginFinishHandler())
     mux.HandleFunc("POST /login/mfa/verify", auth.LoginMFAVerifyHandler())
     mux.HandleFunc("POST /logout", auth.LogoutHandler())
-    mux.HandleFunc("GET /me",      auth.Require()(auth.MeHandler()))
-    mux.HandleFunc("POST /mfa/totp/enroll/start", auth.Require()(auth.TOTPEnrollStartHandler()))
-    mux.HandleFunc("POST /mfa/totp/enroll/confirm", auth.Require()(auth.TOTPEnrollConfirmHandler()))
-    mux.HandleFunc("POST /mfa/webauthn/register/begin", auth.Require()(auth.WebAuthnRegistrationBeginHandler()))
-    mux.HandleFunc("POST /mfa/webauthn/register/finish", auth.Require()(auth.WebAuthnRegistrationFinishHandler()))
-    mux.HandleFunc("POST /mfa/recovery/regenerate", auth.Require()(auth.MFARecoveryRegenerateHandler()))
-    mux.HandleFunc("POST /mfa/disable", auth.Require()(auth.MFADisableHandler()))
+    mux.HandleFunc("GET /me", auth.Require()(auth.MeHandler()))
+    auth.RegisterMeSecurityRoutes(mux)
 
     // Protected routes
     mux.Handle("GET /api/status", auth.Require()(statusHandler))
