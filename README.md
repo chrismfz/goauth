@@ -171,6 +171,147 @@ Security posture for operators:
 - This reduces insider abuse risk by preventing normal operations staff from
   impersonating users with secret-derived OTP output.
 
+### Account Security (Self-Service + Admin Recovery)
+
+This section documents a practical split between **self-service user flows** and
+**admin-assisted recovery** for password + MFA deployments.
+
+> ⚠️ **Do not expose an endpoint that generates the current TOTP code for a user.**
+> Keep production in verify-only mode (`user submits code`, `server verifies code`).
+
+#### Endpoint table
+
+| Path | Method | Auth required | Scope | Expected responses |
+|---|---|---|---|---|
+| `/login` | `POST` | No | Self | `200` success session, or `200` `{ "mfa_required": true }`, `401` invalid credentials, `429` rate limited |
+| `/login/mfa/verify` | `POST` | Pending login challenge | Self | `200` session established, `400` bad payload/method, `401` invalid MFA proof |
+| `/mfa/totp/enroll/start` | `POST` | Session | Self | `200` enrollment payload (`otpauth_url`, QR data), `401` unauthenticated |
+| `/mfa/totp/enroll/confirm` | `POST` | Session | Self | `200` MFA enabled + recovery codes, `400` invalid code, `401` unauthenticated |
+| `/mfa/recovery/regenerate` | `POST` | Session + successful MFA step-up (recommended) | Self | `200` new recovery codes (shown once), `401` unauthenticated, `403` policy blocked |
+| `/me` | `GET` | Session | Self | `200` current user profile, `401` unauthenticated |
+| `/admin/users/{username}/mfa/reset` | `POST` | Admin session/token | Admin | `204` reset complete, `403` non-admin, `404` user not found |
+| `/admin/users/{username}/mfa/recovery/regenerate` | `POST` | Admin session/token | Admin | `200` new recovery codes for out-of-band delivery, `403` non-admin, `404` user not found |
+| `myapp auth mfa reset --user <name>` | CLI | Local operator access + admin controls | CLI admin | Exit `0` success, non-zero on validation or storage error |
+| `myapp auth mfa recovery-regenerate --user <name>` | CLI | Local operator access + admin controls | CLI admin | Exit `0` success (prints one-time codes once), non-zero on error |
+
+#### Role matrix
+
+| Capability | User | Admin (API/UI) | CLI admin |
+|---|---:|---:|---:|
+| Sign in with password | ✅ | ✅ | ✅ |
+| Complete MFA challenge (TOTP/passkey/recovery code) | ✅ | ✅ | ✅ (for own account) |
+| Start/confirm own TOTP enrollment | ✅ | ✅ | ⚠️ (usually not needed) |
+| Regenerate own recovery codes | ✅ | ✅ | ✅ |
+| View another user's current MFA secrets/codes | ❌ | ❌ | ❌ |
+| Reset another user's MFA state | ❌ | ✅ | ✅ |
+| Regenerate another user's recovery codes | ❌ | ✅ | ✅ |
+| Force password reset for another user | ❌ | ✅ | ✅ |
+
+#### Example integration snippets (Argus / CFM style route registration)
+
+```go
+// Public login/logout + MFA verification
+mux.HandleFunc("POST /login", auth.LoginHandler())
+mux.HandleFunc("POST /login/mfa/verify", auth.LoginMFAVerifyHandler())
+mux.HandleFunc("POST /logout", auth.LogoutHandler())
+
+// Authenticated self-service security routes:
+// /mfa/totp/enroll/start
+// /mfa/totp/enroll/confirm
+// /mfa/recovery/regenerate
+auth.RegisterMeSecurityRoutes(mux)
+
+// Admin recovery routes behind admin middleware.
+mux.Handle("POST /admin/users/{username}/mfa/reset",
+    auth.Require("admin")(http.HandlerFunc(handleAdminMFAReset)))
+mux.Handle("POST /admin/users/{username}/mfa/recovery/regenerate",
+    auth.Require("admin")(http.HandlerFunc(handleAdminRecoveryRegenerate)))
+```
+
+#### Recovery playbooks
+
+1. **Lost authenticator device (preferred path)**
+   1. User signs in with password + recovery code (`/login` then `/login/mfa/verify`).
+   2. User regenerates recovery codes (`/mfa/recovery/regenerate`).
+   3. User re-enrolls authenticator (`/mfa/totp/enroll/start` then `/mfa/totp/enroll/confirm`).
+   4. If user cannot complete step 1, admin uses `mfa recovery-regenerate` (preferred) or `mfa reset` (break-glass).
+2. **Forgot password + no MFA device**
+   1. Admin verifies identity out-of-band (support SOP, legal/compliance checks).
+   2. Admin issues temporary password reset and MFA reset in one controlled ticket.
+   3. On next login, user must set a new password, enroll TOTP, and store fresh recovery codes.
+   4. Audit all admin actions and require short expiration for temporary credentials.
+
+#### Backward-compatibility notes + rollout order
+
+Roll out in phases to avoid breaking existing API/CLI flows:
+
+1. **Phase 1: password-only baseline**  
+   Keep existing `/login` behavior, add session hardening and audit visibility first.
+2. **Phase 2: TOTP enrollment + verify**  
+   Enable optional TOTP for early adopters; return `mfa_required` only for enrolled users.
+3. **Phase 3: recovery codes + admin playbooks**  
+   Add self-service regeneration and documented admin recovery paths.
+4. **Phase 4: passkeys optional**  
+   Offer passkeys as an alternative second factor / passwordless path without removing password+TOTP compatibility.
+
+Compatibility expectations:
+
+- Existing password-only users continue to authenticate until individually enrolled in MFA.
+- Existing bearer-token and allowlisted-IP API clients remain unaffected when route guards still accept token/IP paths.
+- Recovery code storage should remain hashed-at-rest and one-time-use to preserve prior security guarantees.
+
+#### Example JSON payloads + UI flow notes
+
+TOTP enrollment start response (example):
+
+```json
+{
+  "mfa_type": "totp",
+  "issuer": "myapp",
+  "account_name": "chris@example.com",
+  "otpauth_url": "otpauth://totp/myapp:chris@example.com?secret=BASE32SECRET&issuer=myapp",
+  "qr_svg": "<svg><!-- redacted --></svg>"
+}
+```
+
+TOTP enrollment confirm request:
+
+```json
+{
+  "code": "123456"
+}
+```
+
+Enrollment confirm success with recovery codes:
+
+```json
+{
+  "mfa_enabled": true,
+  "recovery_codes": [
+    "ABCD-EFGH-IJKL",
+    "MNOP-QRST-UVWX",
+    "YZ12-3456-7890"
+  ]
+}
+```
+
+Recovery code verification during login:
+
+```json
+{
+  "method": "recovery_code",
+  "code": "ABCD-EFGH-IJKL"
+}
+```
+
+UI flow notes:
+
+- Show QR + manual key fallback on enrollment start.
+- Require immediate confirmation (`code`) before marking MFA enabled.
+- Display recovery codes **exactly once** with mandatory download/copy acknowledgement.
+- Require re-auth or step-up before regeneration to reduce account takeover risk.
+- Never display raw TOTP secrets or server-generated current OTP values in UI or API.
+
 ---
 
 ## Real-world integration: layered auth (Argus / CFM pattern)
