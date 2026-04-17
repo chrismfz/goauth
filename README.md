@@ -49,8 +49,13 @@ func main() {
 
     // Public auth endpoints
     mux.HandleFunc("POST /login",  auth.LoginHandler())
+    mux.HandleFunc("POST /login/mfa/verify", auth.LoginMFAVerifyHandler())
     mux.HandleFunc("POST /logout", auth.LogoutHandler())
     mux.HandleFunc("GET /me",      auth.Require()(auth.MeHandler()))
+    mux.HandleFunc("POST /mfa/totp/enroll/start", auth.Require()(auth.TOTPEnrollStartHandler()))
+    mux.HandleFunc("POST /mfa/totp/enroll/confirm", auth.Require()(auth.TOTPEnrollConfirmHandler()))
+    mux.HandleFunc("POST /mfa/recovery/regenerate", auth.Require()(auth.MFARecoveryRegenerateHandler()))
+    mux.HandleFunc("POST /mfa/disable", auth.Require()(auth.MFADisableHandler()))
 
     // Protected routes
     mux.Handle("GET /api/status", auth.Require()(statusHandler))
@@ -104,6 +109,27 @@ Returns on success:
 ```json
 { "username": "chris", "roles": ["admin"] }
 ```
+
+When MFA is enabled, `/login` responds with:
+
+```json
+{ "mfa_required": true, "methods": ["totp", "recovery_code"] }
+```
+
+Complete MFA with `POST /login/mfa/verify`:
+
+```json
+{ "method": "totp", "code": "123456" }
+```
+
+or:
+
+```json
+{ "method": "recovery_code", "code": "ABCD-EFGH-IJKL" }
+```
+
+Recovery codes are one-time-use, stored hashed at rest, and plaintext is only
+returned from `POST /mfa/recovery/regenerate` when new codes are created.
 
 ---
 

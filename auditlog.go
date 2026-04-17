@@ -15,10 +15,11 @@ const (
 
 // LogReason constants for the auth_log.reason column.
 const (
-	LogReasonBadCredentials = "bad_credentials"
-	LogReasonUserInactive   = "user_inactive"
-	LogReasonTooManyIP      = "too_many_attempts_ip"
-	LogReasonTooManyUser    = "too_many_attempts_user"
+	LogReasonBadCredentials  = "bad_credentials"
+	LogReasonUserInactive    = "user_inactive"
+	LogReasonTooManyIP       = "too_many_attempts_ip"
+	LogReasonTooManyUser     = "too_many_attempts_user"
+	LogReasonMFARecoveryUsed = "mfa_recovery_code_used"
 )
 
 // AuthLogEntry is a single row from the auth_log table.
