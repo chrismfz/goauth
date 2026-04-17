@@ -22,6 +22,16 @@ type loginMFAVerifyRequest struct {
 	Code string `json:"code"`
 }
 
+type totpEnrollConfirmRequest struct {
+	Code string `json:"code"`
+}
+
+type mfaDisableRequest struct {
+	Password string `json:"password"`
+}
+
+const mfaProofWindow = 10 * time.Minute
+
 // clientIP extracts the real client IP for audit logging and rate limiting.
 // Trusts X-Forwarded-For only when the direct connection is from loopback.
 func clientIP(r *http.Request) string {
@@ -70,7 +80,11 @@ func (m *Manager) verifyMFA(username, code string) (bool, error) {
 		return false, err
 	}
 	if err == nil && encryptedSecret != "" {
-		if totp.Validate(code, encryptedSecret) {
+		secret, err := decryptSecret(encryptedSecret, m.mfaKey)
+		if err != nil {
+			return false, fmt.Errorf("decrypt totp secret: %w", err)
+		}
+		if totp.Validate(code, secret) {
 			return true, nil
 		}
 	}
@@ -83,6 +97,171 @@ func (m *Manager) verifyMFA(username, code string) (bool, error) {
 		return false, err
 	}
 	return consumed, nil
+}
+
+func (m *Manager) hasRecentMFAProof(r *http.Request) bool {
+	raw := m.session.GetString(r.Context(), sessionMFAVerifiedAtKey)
+	if raw == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) <= mfaProofWindow
+}
+
+func (m *Manager) writeMFAProof(r *http.Request) {
+	m.session.Put(r.Context(), sessionMFAVerifiedAtKey, time.Now().Format(time.RFC3339Nano))
+}
+
+// TOTPEnrollStartHandler creates a fresh unverified TOTP secret and returns
+// the otpauth URI for QR-code generation.
+func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		user, ok := UserFromContext(r.Context())
+		if !ok || user.Username == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+
+		key, err := totp.Generate(totp.GenerateOpts{
+			Issuer:      m.cfg.MFAIssuer,
+			AccountName: user.Username,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not generate TOTP secret"})
+			return
+		}
+
+		enc, err := encryptSecret(key.Secret(), m.mfaKey)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not protect TOTP secret"})
+			return
+		}
+		if err := m.Users.SetTOTPSecretUnverified(user.Username, enc); err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store TOTP secret"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]string{
+			"issuer":      m.cfg.MFAIssuer,
+			"account":     user.Username,
+			"otpauth_uri": key.URL(),
+		})
+	}
+}
+
+// TOTPEnrollConfirmHandler verifies one code from the newly enrolled authenticator
+// and enables TOTP MFA for the current user.
+func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		user, ok := UserFromContext(r.Context())
+		if !ok || user.Username == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+		var req totpEnrollConfirmRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		enc, err := m.Users.GetTOTPSecret(user.Username)
+		if err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read TOTP secret"})
+			return
+		}
+		if enc == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no pending TOTP enrollment"})
+			return
+		}
+
+		secret, err := decryptSecret(enc, m.mfaKey)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read TOTP secret"})
+			return
+		}
+		if !totp.Validate(normalizeMFACode(req.Code), secret) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid TOTP code"})
+			return
+		}
+		if err := m.Users.ConfirmTOTP(user.Username); err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not enable TOTP MFA"})
+			return
+		}
+		m.writeMFAProof(r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mfa_enabled": true,
+			"mfa_type":    "totp",
+		})
+	}
+}
+
+// MFADisableHandler disables all configured MFA for the current user.
+// Requires either recent MFA proof in the current session or password re-auth.
+func (m *Manager) MFADisableHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		user, ok := UserFromContext(r.Context())
+		if !ok || user.Username == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+
+		var req mfaDisableRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		req.Password = strings.TrimSpace(req.Password)
+
+		if !m.hasRecentMFAProof(r) {
+			if req.Password == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{
+					"error": "re-authentication required (password or recent MFA proof)",
+				})
+				return
+			}
+			if _, err := m.Users.Authenticate(user.Username, req.Password); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
+				return
+			}
+		}
+
+		if err := m.Users.DisableMFA(user.Username); err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not disable MFA"})
+			return
+		}
+		m.session.Remove(r.Context(), sessionMFAVerifiedAtKey)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mfa_enabled": false,
+		})
+	}
 }
 
 // LoginHandler returns an http.Handler that accepts POST requests with
@@ -281,6 +460,7 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
 		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+		m.writeMFAProof(r)
 		auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_verified")
 
 		writeJSON(w, http.StatusOK, map[string]any{
