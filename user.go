@@ -139,17 +139,31 @@ func (s *UserStore) Delete(username string) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// EnableTOTP enables TOTP MFA for the given user and stores the encrypted secret.
-func (s *UserStore) EnableTOTP(username, encryptedSecret string) error {
+// SetTOTPSecretUnverified stores an encrypted TOTP secret without enabling MFA.
+func (s *UserStore) SetTOTPSecretUnverified(username, encryptedSecret string) error {
+	res, err := s.db.Exec(
+		`UPDATE users
+		 SET mfa_enabled=0, mfa_type='totp', totp_secret_enc=?, totp_verified_at=NULL, updated_at=?
+		 WHERE username=? COLLATE NOCASE`,
+		encryptedSecret, time.Now().Unix(), username,
+	)
+	if err != nil {
+		return fmt.Errorf("goauth: set totp secret unverified: %w", err)
+	}
+	return requireOneRow(res, ErrUserNotFound)
+}
+
+// ConfirmTOTP marks an existing TOTP secret as enabled/verified.
+func (s *UserStore) ConfirmTOTP(username string) error {
 	now := time.Now().Unix()
 	res, err := s.db.Exec(
 		`UPDATE users
-		 SET mfa_enabled=1, mfa_type='totp', totp_secret_enc=?, totp_verified_at=?, updated_at=?
-		 WHERE username=? COLLATE NOCASE`,
-		encryptedSecret, now, now, username,
+		 SET mfa_enabled=1, mfa_type='totp', totp_verified_at=?, updated_at=?
+		 WHERE username=? COLLATE NOCASE AND totp_secret_enc IS NOT NULL`,
+		now, now, username,
 	)
 	if err != nil {
-		return fmt.Errorf("goauth: enable totp: %w", err)
+		return fmt.Errorf("goauth: confirm totp: %w", err)
 	}
 	return requireOneRow(res, ErrUserNotFound)
 }

@@ -19,6 +19,7 @@ const (
 	sessionRolesKey              = "goauth.roles"
 	sessionMFAPendingUserKey     = "goauth.mfa_pending_user"
 	sessionMFAPendingDeadlineKey = "goauth.mfa_deadline"
+	sessionMFAVerifiedAtKey      = "goauth.mfa_verified_at"
 )
 
 // UserFromContext retrieves the authenticated User from the request context.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -56,6 +57,15 @@ type Config struct {
 	// LoginRateLimit, if set, enables per-IP and per-username rate limiting
 	// on the login endpoint. Defaults to true when using LoginHandler().
 	LoginRateLimit bool
+
+	// MFAEncryptionKey is the symmetric key used to encrypt TOTP secrets at rest.
+	// When empty, New() falls back to env GOAUTH_MFA_ENCRYPTION_KEY.
+	// Accepted formats: raw 16/24/32-byte string, hex, or base64.
+	MFAEncryptionKey string
+
+	// MFAIssuer is used as the issuer label in otpauth:// URIs.
+	// Defaults to "goauth" when empty.
+	MFAIssuer string
 }
 
 func (c *Config) withDefaults() {
@@ -79,6 +89,12 @@ func (c *Config) withDefaults() {
 	if c.LoginPath == "" {
 		c.LoginPath = "/login"
 	}
+	if c.MFAEncryptionKey == "" {
+		c.MFAEncryptionKey = os.Getenv("GOAUTH_MFA_ENCRYPTION_KEY")
+	}
+	if c.MFAIssuer == "" {
+		c.MFAIssuer = "goauth"
+	}
 }
 
 // Manager is the central auth object. Create one per project and share it.
@@ -89,12 +105,18 @@ type Manager struct {
 	Users     *UserStore
 	session   *scs.SessionManager
 	rl        *loginRateLimiter
+	mfaKey    []byte
 }
 
 // New opens (or creates) SQLite databases, runs schema migrations, and
 // returns a ready-to-use Manager.
 func New(cfg Config) (*Manager, error) {
 	cfg.withDefaults()
+
+	mfaKey, err := decodeEncryptionKey(cfg.MFAEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("goauth: invalid MFA encryption key: %w", err)
+	}
 
 	db, err := openSQLiteDB(cfg.DBPath)
 	if err != nil {
@@ -147,6 +169,7 @@ func New(cfg Config) (*Manager, error) {
 		Users:     &UserStore{db: db},
 		session:   sm,
 		rl:        newLoginRateLimiter(),
+		mfaKey:    mfaKey,
 	}
 	return m, nil
 }
