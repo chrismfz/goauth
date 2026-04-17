@@ -151,6 +151,31 @@ or:
 Recovery codes are one-time-use, stored hashed at rest, and plaintext is only
 returned from `POST /mfa/recovery/regenerate` when new codes are created.
 
+### MFA operator support policy (recommended)
+
+Use the following support workflow for account recovery and helpdesk operations:
+
+1. **Lost authenticator device**
+   - Admin runs **`mfa recovery-regenerate`** (preferred) to rotate recovery
+     codes while preserving MFA posture.
+   - If full cleanup is required, admin can run **`mfa reset`**.
+2. **User self-recovery**
+   - User signs in with **password + recovery code** (`/login` then
+     `/login/mfa/verify` with `method="recovery_code"`).
+   - User immediately re-enrolls TOTP (`/mfa/totp/enroll/start` +
+     `/mfa/totp/enroll/confirm`).
+3. **No recovery path exists**
+   - Admin temporarily disables MFA (or resets MFA state), then requires
+     immediate re-enrollment at next login.
+
+Security posture for operators:
+
+- Keep production in **verify-only MFA mode**: server validates submitted MFA
+  codes but does not expose any command that derives or prints the user's
+  current TOTP values from server-side secrets.
+- This reduces insider abuse risk by preventing normal operations staff from
+  impersonating users with secret-derived OTP output.
+
 ---
 
 ## Real-world integration: layered auth (Argus / CFM pattern)
@@ -751,6 +776,16 @@ myapp auth session list
 myapp auth session purge
 myapp auth --db /other/path.db user list   # override default db path
 ```
+
+Recommended MFA support commands to add under `myapp auth mfa`:
+
+```bash
+myapp auth mfa recovery-regenerate -u chris   # preferred recovery action
+myapp auth mfa reset -u chris                 # fallback / break-glass action
+```
+
+Do **not** add a normal-operations command that outputs live TOTP values from
+stored secrets. Keep operator tooling verify-only and recovery/reset focused.
 
 ---
 
