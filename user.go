@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alexedwards/argon2id"
+	"github.com/pquerna/otp/totp"
 )
 
 // Sentinel errors returned by UserStore operations.
@@ -49,6 +50,16 @@ func (u *User) HasRole(role string) bool {
 // UserStore provides user management backed by SQLite.
 type UserStore struct {
 	db *sql.DB
+}
+
+const DefaultRecoveryCodeCount = 10
+
+// TOTPEnrollment holds pending TOTP enrollment payload for CLI/UI display.
+type TOTPEnrollment struct {
+	Issuer     string
+	Account    string
+	Secret     string
+	OTPAuthURI string
 }
 
 // --- Write operations ---
@@ -171,6 +182,58 @@ func (s *UserStore) ConfirmTOTP(username string) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
+// BeginTOTPEnrollment generates and stores a pending TOTP secret for a user.
+// The returned enrollment payload includes the otpauth URI for QR generation.
+func (s *UserStore) BeginTOTPEnrollment(username, issuer string, mfaKey []byte) (*TOTPEnrollment, error) {
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      issuer,
+		AccountName: username,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("goauth: begin totp enrollment: %w", err)
+	}
+
+	enc, err := encryptSecret(key.Secret(), mfaKey)
+	if err != nil {
+		return nil, fmt.Errorf("goauth: begin totp enrollment: %w", err)
+	}
+	if err := s.SetTOTPSecretUnverified(username, enc); err != nil {
+		return nil, err
+	}
+
+	return &TOTPEnrollment{
+		Issuer:     issuer,
+		Account:    username,
+		Secret:     key.Secret(),
+		OTPAuthURI: key.URL(),
+	}, nil
+}
+
+// VerifyTOTPEnrollment validates a TOTP code against a pending secret and
+// enables TOTP MFA on success.
+func (s *UserStore) VerifyTOTPEnrollment(username, code string, mfaKey []byte) (verified bool, pending bool, err error) {
+	enc, err := s.GetTOTPSecret(username)
+	if err != nil {
+		return false, false, err
+	}
+	if enc == "" {
+		return false, false, nil
+	}
+	pending = true
+
+	secret, err := decryptSecret(enc, mfaKey)
+	if err != nil {
+		return false, pending, fmt.Errorf("goauth: verify totp enrollment: %w", err)
+	}
+	if !totp.Validate(normalizeMFACode(code), secret) {
+		return false, pending, nil
+	}
+	if err := s.ConfirmTOTP(username); err != nil {
+		return false, pending, err
+	}
+	return true, pending, nil
+}
+
 // DisableMFA disables all MFA factors for the given user.
 func (s *UserStore) DisableMFA(username string) error {
 	res, err := s.db.Exec(
@@ -183,6 +246,51 @@ func (s *UserStore) DisableMFA(username string) error {
 		return fmt.Errorf("goauth: disable mfa: %w", err)
 	}
 	return requireOneRow(res, ErrUserNotFound)
+}
+
+// ResetMFA clears all MFA factors and pending MFA challenges for a user.
+func (s *UserStore) ResetMFA(username string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	defer tx.Rollback()
+
+	var userID int64
+	if err := tx.QueryRow(
+		`SELECT id FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&userID); errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	} else if err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := tx.Exec(
+		`UPDATE users
+		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
+		 WHERE id=?`,
+		now, userID,
+	); err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM mfa_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM webauthn_credentials WHERE user_id=?`, userID); err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM webauthn_challenges WHERE username=? COLLATE NOCASE`,
+		username,
+	); err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("goauth: reset mfa: %w", err)
+	}
+	return nil
 }
 
 func hashRecoveryCode(code string) string {
