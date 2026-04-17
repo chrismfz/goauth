@@ -13,13 +13,13 @@ import (
 // Both must pass for a login attempt to proceed. Counters are kept
 // in-memory and pruned periodically — no database writes on the hot path.
 type loginRateLimiter struct {
-	mu          sync.Mutex
-	byIP        map[string][]time.Time
-	byUser      map[string][]time.Time
-	windowIP    time.Duration
-	windowUser  time.Duration
-	maxPerIP    int
-	maxPerUser  int
+	mu         sync.Mutex
+	byIP       map[string][]time.Time
+	byUser     map[string][]time.Time
+	windowIP   time.Duration
+	windowUser time.Duration
+	maxPerIP   int
+	maxPerUser int
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
@@ -28,8 +28,8 @@ func newLoginRateLimiter() *loginRateLimiter {
 		byUser:     make(map[string][]time.Time),
 		windowIP:   time.Minute,
 		windowUser: 10 * time.Minute,
-		maxPerIP:   10,  // 10 attempts / min per IP
-		maxPerUser: 20,  // 20 attempts / 10 min per username
+		maxPerIP:   10, // 10 attempts / min per IP
+		maxPerUser: 20, // 20 attempts / 10 min per username
 	}
 	go rl.cleanup(5 * time.Minute)
 	return rl

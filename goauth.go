@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alexedwards/scs/v2"
+	webauthnlib "github.com/go-webauthn/webauthn/webauthn"
 	_ "modernc.org/sqlite"
 )
 
@@ -66,6 +67,18 @@ type Config struct {
 	// MFAIssuer is used as the issuer label in otpauth:// URIs.
 	// Defaults to "goauth" when empty.
 	MFAIssuer string
+
+	// WebAuthnRPID is the relying-party ID (effective domain), e.g. "example.com".
+	// If empty, WebAuthn endpoints are disabled.
+	WebAuthnRPID string
+
+	// WebAuthnRPDisplayName is the user-visible relying-party name.
+	// Defaults to MFAIssuer when empty.
+	WebAuthnRPDisplayName string
+
+	// WebAuthnOrigins is the list of allowed origins (e.g. https://app.example.com).
+	// Required when WebAuthnRPID is set.
+	WebAuthnOrigins []string
 }
 
 func (c *Config) withDefaults() {
@@ -95,6 +108,9 @@ func (c *Config) withDefaults() {
 	if c.MFAIssuer == "" {
 		c.MFAIssuer = "goauth"
 	}
+	if c.WebAuthnRPDisplayName == "" {
+		c.WebAuthnRPDisplayName = c.MFAIssuer
+	}
 }
 
 // Manager is the central auth object. Create one per project and share it.
@@ -106,6 +122,7 @@ type Manager struct {
 	session   *scs.SessionManager
 	rl        *loginRateLimiter
 	mfaKey    []byte
+	webAuthn  *webauthnlib.WebAuthn
 }
 
 // New opens (or creates) SQLite databases, runs schema migrations, and
@@ -162,6 +179,23 @@ func New(cfg Config) (*Manager, error) {
 		log.Printf("goauth/store: commit: %v", err)
 	}
 
+	var wa *webauthnlib.WebAuthn
+	if strings.TrimSpace(cfg.WebAuthnRPID) != "" {
+		waConfig := &webauthnlib.Config{
+			RPID:          cfg.WebAuthnRPID,
+			RPDisplayName: cfg.WebAuthnRPDisplayName,
+			RPOrigins:     cfg.WebAuthnOrigins,
+		}
+		wa, err = webauthnlib.New(waConfig)
+		if err != nil {
+			if sessionDB != db {
+				_ = sessionDB.Close()
+			}
+			_ = db.Close()
+			return nil, fmt.Errorf("goauth: configure webauthn: %w", err)
+		}
+	}
+
 	m := &Manager{
 		cfg:       cfg,
 		db:        db,
@@ -170,6 +204,7 @@ func New(cfg Config) (*Manager, error) {
 		session:   sm,
 		rl:        newLoginRateLimiter(),
 		mfaKey:    mfaKey,
+		webAuthn:  wa,
 	}
 	return m, nil
 }
