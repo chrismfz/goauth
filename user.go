@@ -1,12 +1,15 @@
 package goauth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/argon2id"
@@ -182,34 +185,158 @@ func (s *UserStore) DisableMFA(username string) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// ConsumeRecoveryCode deletes a single matching MFA recovery code hash for a user.
-// It returns true only when a matching code existed and was consumed.
-func (s *UserStore) ConsumeRecoveryCode(username, code string) (bool, error) {
+func hashRecoveryCode(code string) string {
+	sum := sha256.Sum256([]byte(normalizeMFACode(code)))
+	return hex.EncodeToString(sum[:])
+}
+
+func generateRecoveryCode() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	enc := strings.TrimRight(base32.StdEncoding.EncodeToString(buf), "=")
+	enc = strings.ToUpper(enc)
+	if len(enc) > 12 {
+		enc = enc[:12]
+	}
+	return enc[:4] + "-" + enc[4:8] + "-" + enc[8:12], nil
+}
+
+// GenerateRecoveryCodes rotates all recovery codes for a user and returns
+// the newly generated plaintext values. Callers must display them once and
+// never persist plaintext at rest.
+func (s *UserStore) GenerateRecoveryCodes(username string, count int) ([]string, error) {
+	if count <= 0 {
+		return nil, errors.New("goauth: recovery code count must be positive")
+	}
+
 	var userID int64
 	if err := s.db.QueryRow(
 		`SELECT id FROM users WHERE username=? COLLATE NOCASE`,
 		username,
 	).Scan(&userID); errors.Is(err, sql.ErrNoRows) {
-		return false, ErrUserNotFound
+		return nil, ErrUserNotFound
 	} else if err != nil {
-		return false, fmt.Errorf("goauth: consume recovery code: %w", err)
+		return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
 	}
 
-	sum := sha256.Sum256([]byte(code))
-	codeHash := hex.EncodeToString(sum[:])
-	res, err := s.db.Exec(
+	codes := make([]string, 0, count)
+	seen := map[string]struct{}{}
+	for len(codes) < count {
+		code, err := generateRecoveryCode()
+		if err != nil {
+			return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+		}
+		norm := normalizeMFACode(code)
+		if _, ok := seen[norm]; ok {
+			continue
+		}
+		seen[norm] = struct{}{}
+		codes = append(codes, code)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM mfa_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+	}
+	now := time.Now().Unix()
+	for _, code := range codes {
+		if _, err := tx.Exec(
+			`INSERT INTO mfa_recovery_codes (user_id, code_hash, created_at) VALUES (?, ?, ?)`,
+			userID, hashRecoveryCode(code), now,
+		); err != nil {
+			return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+		}
+	}
+	if _, err := tx.Exec(
+		`UPDATE users SET updated_at=? WHERE id=?`,
+		now, userID,
+	); err != nil {
+		return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("goauth: generate recovery codes: %w", err)
+	}
+	return codes, nil
+}
+
+// CountRecoveryCodes returns the number of remaining recovery codes for a user.
+func (s *UserStore) CountRecoveryCodes(username string) (int, error) {
+	var userID int64
+	if err := s.db.QueryRow(
+		`SELECT id FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&userID); errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrUserNotFound
+	} else if err != nil {
+		return 0, fmt.Errorf("goauth: count recovery codes: %w", err)
+	}
+
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id=?`,
+		userID,
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("goauth: count recovery codes: %w", err)
+	}
+	return count, nil
+}
+
+// ConsumeRecoveryCode deletes a single matching MFA recovery code hash for a user.
+// It returns true only when a matching code existed and was consumed.
+func (s *UserStore) ConsumeRecoveryCode(username, code string) (bool, int, error) {
+	var userID int64
+	if err := s.db.QueryRow(
+		`SELECT id FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&userID); errors.Is(err, sql.ErrNoRows) {
+		return false, 0, ErrUserNotFound
+	} else if err != nil {
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
 		`DELETE FROM mfa_recovery_codes
 		 WHERE user_id=? AND code_hash=?`,
-		userID, codeHash,
+		userID, hashRecoveryCode(code),
 	)
 	if err != nil {
-		return false, fmt.Errorf("goauth: consume recovery code: %w", err)
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return n > 0, nil
+
+	var remaining int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id=?`,
+		userID,
+	).Scan(&remaining); err != nil {
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE users SET updated_at=? WHERE id=?`,
+		time.Now().Unix(), userID,
+	); err != nil {
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, fmt.Errorf("goauth: consume recovery code: %w", err)
+	}
+	return n > 0, remaining, nil
 }
 
 // --- Read operations ---

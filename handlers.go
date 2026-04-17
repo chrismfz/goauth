@@ -19,7 +19,8 @@ type loginRequest struct {
 
 // loginMFAVerifyRequest is the JSON body expected by LoginMFAVerifyHandler.
 type loginMFAVerifyRequest struct {
-	Code string `json:"code"`
+	Method string `json:"method"`
+	Code   string `json:"code"`
 }
 
 type totpEnrollConfirmRequest struct {
@@ -31,6 +32,11 @@ type mfaDisableRequest struct {
 }
 
 const mfaProofWindow = 10 * time.Minute
+
+const (
+	recoveryCodeCount               = 10
+	recoveryCodeRegenerateThreshold = 2
+)
 
 // clientIP extracts the real client IP for audit logging and rate limiting.
 // Trusts X-Forwarded-For only when the direct connection is from loopback.
@@ -69,34 +75,141 @@ func normalizeMFACode(code string) string {
 	return code
 }
 
-func (m *Manager) verifyMFA(username, code string) (bool, error) {
+type mfaVerifyResult struct {
+	OK                         bool
+	Method                     string
+	RecoveryCodesRemaining     int
+	RecoveryRegenerateRequired bool
+	RecoveryCodesExhausted     bool
+}
+
+func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, error) {
+	result := mfaVerifyResult{
+		RecoveryCodesRemaining: -1,
+	}
+
+	method = strings.TrimSpace(strings.ToLower(method))
 	code = normalizeMFACode(code)
 	if code == "" {
-		return false, nil
+		return result, nil
 	}
 
-	encryptedSecret, err := m.Users.GetTOTPSecret(username)
-	if err != nil && !errors.Is(err, ErrUserNotFound) {
-		return false, err
-	}
-	if err == nil && encryptedSecret != "" {
-		secret, err := decryptSecret(encryptedSecret, m.mfaKey)
-		if err != nil {
-			return false, fmt.Errorf("decrypt totp secret: %w", err)
+	if method == "" || method == "totp" {
+		encryptedSecret, err := m.Users.GetTOTPSecret(username)
+		if err != nil && !errors.Is(err, ErrUserNotFound) {
+			return result, err
 		}
-		if totp.Validate(code, secret) {
-			return true, nil
+		if err == nil && encryptedSecret != "" {
+			secret, err := decryptSecret(encryptedSecret, m.mfaKey)
+			if err != nil {
+				return result, fmt.Errorf("decrypt totp secret: %w", err)
+			}
+			if totp.Validate(code, secret) {
+				result.OK = true
+				result.Method = "totp"
+				return result, nil
+			}
+		}
+		if method == "totp" {
+			return result, nil
 		}
 	}
 
-	consumed, err := m.Users.ConsumeRecoveryCode(username, code)
+	if method != "" && method != "recovery_code" {
+		return result, nil
+	}
+
+	remainingBefore, err := m.Users.CountRecoveryCodes(username)
 	if errors.Is(err, ErrUserNotFound) {
-		return false, nil
+		return result, nil
 	}
 	if err != nil {
-		return false, err
+		return result, err
 	}
-	return consumed, nil
+	result.RecoveryCodesRemaining = remainingBefore
+	if remainingBefore == 0 {
+		result.RecoveryCodesExhausted = true
+		return result, nil
+	}
+	if remainingBefore <= recoveryCodeRegenerateThreshold {
+		result.RecoveryRegenerateRequired = true
+		return result, nil
+	}
+
+	consumed, remainingAfter, err := m.Users.ConsumeRecoveryCode(username, code)
+	if errors.Is(err, ErrUserNotFound) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	result.RecoveryCodesRemaining = remainingAfter
+	if !consumed {
+		if remainingAfter == 0 {
+			result.RecoveryCodesExhausted = true
+		}
+		return result, nil
+	}
+	result.OK = true
+	result.Method = "recovery_code"
+	if remainingAfter <= recoveryCodeRegenerateThreshold {
+		result.RecoveryRegenerateRequired = true
+	}
+	return result, nil
+}
+
+type regenerateRecoveryCodesRequest struct {
+	Password string `json:"password"`
+}
+
+// MFARecoveryRegenerateHandler rotates the currently authenticated user's
+// recovery codes and returns the new plaintext codes exactly once.
+func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		user, ok := UserFromContext(r.Context())
+		if !ok || user.Username == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+
+		var req regenerateRecoveryCodesRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		req.Password = strings.TrimSpace(req.Password)
+
+		if !m.hasRecentMFAProof(r) {
+			if req.Password == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{
+					"error": "re-authentication required (password or recent MFA proof)",
+				})
+				return
+			}
+			if _, err := m.Users.Authenticate(user.Username, req.Password); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
+				return
+			}
+		}
+
+		codes, err := m.Users.GenerateRecoveryCodes(user.Username, recoveryCodeCount)
+		if err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not regenerate recovery codes"})
+			return
+		}
+		m.writeMFAProof(r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"codes":                codes,
+			"total_codes":          len(codes),
+			"regenerate_threshold": recoveryCodeRegenerateThreshold,
+			"warning":              "save these recovery codes now; they will not be shown again",
+		})
+	}
 }
 
 func (m *Manager) hasRecentMFAProof(r *http.Request) bool {
@@ -362,7 +475,8 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 
 // LoginMFAVerifyHandler verifies an MFA code for a pending login session.
 //
-// Accepts POST /login/mfa/verify with JSON body: {"code":"123456"}
+// Accepts POST /login/mfa/verify with JSON body:
+// {"method":"totp","code":"123456"} or {"method":"recovery_code","code":"ABCD-EFGH-IJKL"}
 //
 // On success:  200 {"username":"...","roles":[...]}
 // On failure:  401 {"error":"invalid MFA code"}
@@ -400,6 +514,14 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
+		req.Method = strings.TrimSpace(strings.ToLower(req.Method))
+		if req.Method != "" && req.Method != "totp" && req.Method != "recovery_code" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":             "invalid MFA method",
+				"supported_methods": []string{"totp", "recovery_code"},
+			})
+			return
+		}
 
 		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
 			reason := LogReasonTooManyIP
@@ -418,13 +540,34 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			return
 		}
 
-		ok, err := m.verifyMFA(username, req.Code)
+		verify, err := m.verifyMFA(username, req.Method, req.Code)
 		if err != nil {
 			auditLog(m.db, LogEventFail, username, ip, "mfa_internal_error")
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
-		if !ok {
+
+		if verify.RecoveryCodesExhausted {
+			auditLog(m.db, LogEventFail, username, ip, "mfa_recovery_codes_exhausted")
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":               "recovery codes exhausted; regenerate recovery codes from account settings",
+				"code":                "recovery_codes_exhausted",
+				"regenerate_required": true,
+			})
+			return
+		}
+		if verify.RecoveryRegenerateRequired && !verify.OK && (req.Method == "recovery_code" || req.Method == "") {
+			auditLog(m.db, LogEventFail, username, ip, "mfa_recovery_regeneration_required")
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":               "recovery code login disabled until you regenerate recovery codes",
+				"code":                "recovery_regeneration_required",
+				"recovery_remaining":  verify.RecoveryCodesRemaining,
+				"regenerate_required": true,
+			})
+			return
+		}
+
+		if !verify.OK {
 			auditLog(m.db, LogEventFail, username, ip, "mfa_invalid_code")
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid MFA code"})
 			return
@@ -461,12 +604,24 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
 		m.writeMFAProof(r)
-		auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_verified")
+		reason := "mfa_verified"
+		if verify.Method == "recovery_code" {
+			reason = LogReasonMFARecoveryUsed
+		}
+		auditLog(m.db, LogEventSuccess, user.Username, ip, reason)
 
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"username": user.Username,
 			"roles":    user.Roles,
-		})
+		}
+		if verify.Method != "" {
+			resp["method"] = verify.Method
+		}
+		if verify.Method == "recovery_code" {
+			resp["recovery_remaining"] = verify.RecoveryCodesRemaining
+			resp["regenerate_required"] = verify.RecoveryRegenerateRequired
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
