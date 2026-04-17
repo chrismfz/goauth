@@ -31,11 +31,157 @@ type mfaDisableRequest struct {
 	Password string `json:"password"`
 }
 
+type passwordChangeRequest struct {
+	Subject         string `json:"subject"`
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+type factorsResponse struct {
+	Subject                string `json:"subject"`
+	HasTOTP                bool   `json:"has_totp"`
+	PasskeyCount           int    `json:"passkey_count"`
+	RecoveryCodesRemaining int    `json:"recovery_codes_remaining"`
+}
+
 const mfaProofWindow = 10 * time.Minute
 
 const (
 	recoveryCodeRegenerateThreshold = 2
 )
+
+func actorReason(actor, target string) string {
+	if strings.EqualFold(actor, target) {
+		return "self_service"
+	}
+	return "admin_scope"
+}
+
+func (m *Manager) resolveSecuritySubjectOrWriteError(w http.ResponseWriter, r *http.Request, requested string) (*User, string, bool) {
+	actor, ok := UserFromContext(r.Context())
+	if !ok || strings.TrimSpace(actor.Username) == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		return nil, "", false
+	}
+
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		requested = strings.TrimSpace(r.URL.Query().Get("subject"))
+	}
+	if requested == "" || strings.EqualFold(requested, actor.Username) {
+		return actor, actor.Username, true
+	}
+	if hasAnyRole(actor.Roles, []string{"admin"}) {
+		return actor, requested, true
+	}
+
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+	return nil, "", false
+}
+
+// SecurityPasswordChangeHandler changes the authenticated user's password.
+// A different subject can only be targeted by callers with admin role.
+func (m *Manager) SecurityPasswordChangeHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req passwordChangeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, req.Subject)
+		if !ok {
+			return
+		}
+
+		requireCurrentPassword := strings.EqualFold(actor.Username, subject) || !hasAnyRole(actor.Roles, []string{"admin"})
+		req.CurrentPassword = strings.TrimSpace(req.CurrentPassword)
+		req.NewPassword = strings.TrimSpace(req.NewPassword)
+		if req.NewPassword == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_password is required"})
+			return
+		}
+		if requireCurrentPassword {
+			if req.CurrentPassword == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "current_password is required"})
+				return
+			}
+			if _, err := m.Users.Authenticate(subject, req.CurrentPassword); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid current_password"})
+				return
+			}
+		}
+
+		if err := m.Users.SetPassword(subject, req.NewPassword); err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update password"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"password_changed": true,
+			"subject":          subject,
+			"actor":            actor.Username,
+		})
+	}
+}
+
+// SecurityFactorsHandler returns MFA/passkey status for account-security UI.
+// A different subject can only be queried by callers with admin role.
+func (m *Manager) SecurityFactorsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
+			return
+		}
+
+		u, err := m.Users.GetByUsername(subject)
+		if err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load factors"})
+			return
+		}
+
+		creds, err := m.Users.ListWebAuthnCredentials(subject)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load factors"})
+			return
+		}
+
+		recoveryCount, err := m.Users.CountRecoveryCodes(subject)
+		if err != nil {
+			if errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load factors"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, factorsResponse{
+			Subject:                subject,
+			HasTOTP:                u.MFAEnabled && strings.EqualFold(u.MFAType, "totp"),
+			PasskeyCount:           len(creds),
+			RecoveryCodesRemaining: recoveryCount,
+		})
+	}
+}
 
 // clientIP extracts the real client IP for audit logging and rate limiting.
 // Trusts X-Forwarded-For only when the direct connection is from loopback.
@@ -169,9 +315,8 @@ func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		user, ok := UserFromContext(r.Context())
-		if !ok || user.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 
@@ -179,25 +324,25 @@ func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.Password = strings.TrimSpace(req.Password)
 
-		if !m.hasRecentMFAProof(r) {
+		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
 			if req.Password == "" {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{
 					"error": "re-authentication required (password or recent MFA proof)",
 				})
 				return
 			}
-			if _, err := m.Users.Authenticate(user.Username, req.Password); err != nil {
+			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
 				return
 			}
 		}
 
 		auditCtx := AdminAuditContext{
-			Actor:  user.Username,
-			Target: user.Username,
+			Actor:  actor.Username,
+			Target: subject,
 			IP:     clientIP(r),
 			Host:   r.Host,
-			Reason: "self_service",
+			Reason: actorReason(actor.Username, subject),
 		}
 		codes, err := m.AdminRotateRecoveryCodes(auditCtx, DefaultRecoveryCodeCount)
 		if err != nil {
@@ -242,18 +387,17 @@ func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		user, ok := UserFromContext(r.Context())
-		if !ok || user.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 
 		auditCtx := AdminAuditContext{
-			Actor:  user.Username,
-			Target: user.Username,
+			Actor:  actor.Username,
+			Target: subject,
 			IP:     clientIP(r),
 			Host:   r.Host,
-			Reason: "self_service",
+			Reason: actorReason(actor.Username, subject),
 		}
 		enrollment, err := m.AdminBeginTOTPEnrollment(auditCtx)
 		if err != nil {
@@ -281,9 +425,8 @@ func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		user, ok := UserFromContext(r.Context())
-		if !ok || user.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 		var req totpEnrollConfirmRequest
@@ -293,11 +436,11 @@ func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
 		}
 
 		auditCtx := AdminAuditContext{
-			Actor:  user.Username,
-			Target: user.Username,
+			Actor:  actor.Username,
+			Target: subject,
 			IP:     clientIP(r),
 			Host:   r.Host,
-			Reason: "self_service",
+			Reason: actorReason(actor.Username, subject),
 		}
 		err := m.AdminConfirmTOTPEnrollment(auditCtx, req.Code)
 		if err != nil {
@@ -332,9 +475,8 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		user, ok := UserFromContext(r.Context())
-		if !ok || user.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 
@@ -342,25 +484,25 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.Password = strings.TrimSpace(req.Password)
 
-		if !m.hasRecentMFAProof(r) {
+		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
 			if req.Password == "" {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{
 					"error": "re-authentication required (password or recent MFA proof)",
 				})
 				return
 			}
-			if _, err := m.Users.Authenticate(user.Username, req.Password); err != nil {
+			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
 				return
 			}
 		}
 
 		auditCtx := AdminAuditContext{
-			Actor:  user.Username,
-			Target: user.Username,
+			Actor:  actor.Username,
+			Target: subject,
 			IP:     clientIP(r),
 			Host:   r.Host,
-			Reason: "self_service",
+			Reason: actorReason(actor.Username, subject),
 		}
 		if err := m.AdminDisableMFA(auditCtx); err != nil {
 			if errors.Is(err, ErrUserNotFound) {
@@ -375,6 +517,18 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 			"mfa_enabled": false,
 		})
 	}
+}
+
+// RegisterMeSecurityRoutes mounts authenticated /me/security endpoints.
+func (m *Manager) RegisterMeSecurityRoutes(mux *http.ServeMux) {
+	mux.Handle("POST /me/security/password", m.Require()(m.SecurityPasswordChangeHandler()))
+	mux.Handle("POST /me/security/mfa/totp/enroll/start", m.Require()(m.TOTPEnrollStartHandler()))
+	mux.Handle("POST /me/security/mfa/totp/enroll/confirm", m.Require()(m.TOTPEnrollConfirmHandler()))
+	mux.Handle("POST /me/security/mfa/disable", m.Require()(m.MFADisableHandler()))
+	mux.Handle("POST /me/security/recovery-codes/regenerate", m.Require()(m.MFARecoveryRegenerateHandler()))
+	mux.Handle("POST /me/security/passkeys/register/start", m.Require()(m.WebAuthnRegistrationBeginHandler()))
+	mux.Handle("POST /me/security/passkeys/register/finish", m.Require()(m.WebAuthnRegistrationFinishHandler()))
+	mux.Handle("GET /me/security/factors", m.Require()(m.SecurityFactorsHandler()))
 }
 
 // LoginHandler returns an http.Handler that accepts POST requests with

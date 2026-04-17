@@ -135,13 +135,12 @@ func (m *Manager) WebAuthnRegistrationBeginHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "webauthn is not configured"})
 			return
 		}
-		ctxUser, ok := UserFromContext(r.Context())
-		if !ok || ctxUser.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 
-		waUser, err := m.getWebAuthnUser(ctxUser.Username)
+		waUser, err := m.getWebAuthnUser(subject)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not prepare passkey registration"})
 			return
@@ -174,9 +173,8 @@ func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "webauthn is not configured"})
 			return
 		}
-		ctxUser, ok := UserFromContext(r.Context())
-		if !ok || ctxUser.Username == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		if !ok {
 			return
 		}
 
@@ -185,7 +183,7 @@ func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no pending passkey registration challenge"})
 			return
 		}
-		if !strings.EqualFold(rec.Username, ctxUser.Username) {
+		if !strings.EqualFold(rec.Username, subject) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "challenge does not match current user"})
 			return
 		}
@@ -194,7 +192,7 @@ func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
 			return
 		}
 
-		waUser, err := m.getWebAuthnUser(ctxUser.Username)
+		waUser, err := m.getWebAuthnUser(subject)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load user for passkey registration"})
 			return
@@ -204,7 +202,7 @@ func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey attestation"})
 			return
 		}
-		if err := m.Users.UpsertWebAuthnCredential(ctxUser.Username, waUser.userHandle, credential); err != nil {
+		if err := m.Users.UpsertWebAuthnCredential(subject, waUser.userHandle, credential); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store passkey credential"})
 			return
 		}
