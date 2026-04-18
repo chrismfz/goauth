@@ -144,7 +144,7 @@ or:
 ```
 
 Recovery codes are one-time-use, stored hashed at rest, and plaintext is only
-returned from `POST /mfa/recovery/regenerate` when new codes are created.
+returned from `POST /me/security/recovery-codes/regenerate` when new codes are created.
 
 ### MFA operator support policy (recommended)
 
@@ -157,8 +157,8 @@ Use the following support workflow for account recovery and helpdesk operations:
 2. **User self-recovery**
    - User signs in with **password + recovery code** (`/login` then
      `/login/mfa/verify` with `method="recovery_code"`).
-   - User immediately re-enrolls TOTP (`/mfa/totp/enroll/start` +
-     `/mfa/totp/enroll/confirm`).
+   - User immediately re-enrolls TOTP (`/me/security/mfa/totp/enroll/start` +
+     `/me/security/mfa/totp/enroll/confirm`).
 3. **No recovery path exists**
    - Admin temporarily disables MFA (or resets MFA state), then requires
      immediate re-enrollment at next login.
@@ -185,9 +185,9 @@ This section documents a practical split between **self-service user flows** and
 |---|---|---|---|---|
 | `/login` | `POST` | No | Self | `200` success session, or `200` `{ "mfa_required": true }`, `401` invalid credentials, `429` rate limited |
 | `/login/mfa/verify` | `POST` | Pending login challenge | Self | `200` session established, `400` bad payload/method, `401` invalid MFA proof |
-| `/mfa/totp/enroll/start` | `POST` | Session | Self | `200` enrollment payload (`otpauth_url`, QR data), `401` unauthenticated |
-| `/mfa/totp/enroll/confirm` | `POST` | Session | Self | `200` MFA enabled + recovery codes, `400` invalid code, `401` unauthenticated |
-| `/mfa/recovery/regenerate` | `POST` | Session + successful MFA step-up (recommended) | Self | `200` new recovery codes (shown once), `401` unauthenticated, `403` policy blocked |
+| `/me/security/mfa/totp/enroll/start` | `POST` | Session | Self | `200` enrollment payload (`issuer`, `account`, `otpauth_uri`), `401` unauthenticated |
+| `/me/security/mfa/totp/enroll/confirm` | `POST` | Session | Self | `200` MFA enabled + recovery codes, `400` invalid code, `401` unauthenticated |
+| `/me/security/recovery-codes/regenerate` | `POST` | Session + successful MFA step-up (recommended) | Self | `200` new recovery codes (shown once), `401` unauthenticated, `403` policy blocked |
 | `/me` | `GET` | Session | Self | `200` current user profile, `401` unauthenticated |
 | `/admin/users/{username}/mfa/reset` | `POST` | Admin session/token | Admin | `204` reset complete, `403` non-admin, `404` user not found |
 | `/admin/users/{username}/mfa/recovery/regenerate` | `POST` | Admin session/token | Admin | `200` new recovery codes for out-of-band delivery, `403` non-admin, `404` user not found |
@@ -216,9 +216,9 @@ mux.HandleFunc("POST /login/mfa/verify", auth.LoginMFAVerifyHandler())
 mux.HandleFunc("POST /logout", auth.LogoutHandler())
 
 // Authenticated self-service security routes:
-// /mfa/totp/enroll/start
-// /mfa/totp/enroll/confirm
-// /mfa/recovery/regenerate
+// /me/security/mfa/totp/enroll/start
+// /me/security/mfa/totp/enroll/confirm
+// /me/security/recovery-codes/regenerate
 auth.RegisterMeSecurityRoutes(mux)
 
 // Admin recovery routes behind admin middleware.
@@ -232,8 +232,8 @@ mux.Handle("POST /admin/users/{username}/mfa/recovery/regenerate",
 
 1. **Lost authenticator device (preferred path)**
    1. User signs in with password + recovery code (`/login` then `/login/mfa/verify`).
-   2. User regenerates recovery codes (`/mfa/recovery/regenerate`).
-   3. User re-enrolls authenticator (`/mfa/totp/enroll/start` then `/mfa/totp/enroll/confirm`).
+   2. User regenerates recovery codes (`/me/security/recovery-codes/regenerate`).
+   3. User re-enrolls authenticator (`/me/security/mfa/totp/enroll/start` then `/me/security/mfa/totp/enroll/confirm`).
    4. If user cannot complete step 1, admin uses `mfa recovery-regenerate` (preferred) or `mfa reset` (break-glass).
 2. **Forgot password + no MFA device**
    1. Admin verifies identity out-of-band (support SOP, legal/compliance checks).
@@ -268,11 +268,16 @@ TOTP enrollment start response (example):
 {
   "mfa_type": "totp",
   "issuer": "myapp",
-  "account_name": "chris@example.com",
-  "otpauth_url": "otpauth://totp/myapp:chris@example.com?secret=BASE32SECRET&issuer=myapp",
-  "qr_svg": "<svg><!-- redacted --></svg>"
+  "account": "chris@example.com",
+  "otpauth_uri": "otpauth://totp/myapp:chris@example.com?secret=BASE32SECRET&issuer=myapp"
 }
 ```
+
+
+Compatibility note (older clients):
+
+- `TOTPEnrollStartHandler` now returns `otpauth_uri` (current) instead of `otpauth_url` (legacy name).
+- `qr_svg` is not returned by goauth; generate QR assets in the application/UI using `otpauth_uri`.
 
 TOTP enrollment confirm request:
 
