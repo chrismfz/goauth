@@ -522,7 +522,7 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 // RegisterMeSecurityRoutes mounts authenticated /me/security endpoints.
 func (m *Manager) RegisterMeSecurityRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /me/security/password", m.Require()(m.SecurityPasswordChangeHandler()))
-	mux.Handle("POST /me/security/mfa/totp/enroll/start", m.Require()(m.TOTPEnrollStartHandler()))
+	mux.Handle("POST "+RouteMeSecurityTOTPEnrollStart, m.Require()(m.TOTPEnrollStartHandler()))
 	mux.Handle("POST /me/security/mfa/totp/enroll/confirm", m.Require()(m.TOTPEnrollConfirmHandler()))
 	mux.Handle("POST /me/security/mfa/disable", m.Require()(m.MFADisableHandler()))
 	mux.Handle("POST /me/security/recovery-codes/regenerate", m.Require()(m.MFARecoveryRegenerateHandler()))
