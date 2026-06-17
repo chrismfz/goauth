@@ -350,6 +350,21 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey login session"})
 			return
 		}
+
+		mode := webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey))
+		pendingUser := m.session.GetString(r.Context(), sessionMFAPendingUserKey)
+		if pendingUser != "" {
+			if !strings.EqualFold(pendingUser, rec.Username) {
+				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+				m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+				m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+				auditLog(m.db, LogEventFail, pendingUser, ip, "mfa_passkey_user_mismatch")
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "passkey challenge does not match pending MFA user"})
+				return
+			}
+			mode = webauthnLoginModeMFA
+		}
+
 		credential, err := m.webAuthn.FinishLogin(waUser, rec.SessionData, r)
 		if err != nil {
 			auditLog(m.db, LogEventFail, rec.Username, ip, "passkey_assertion_failed")
@@ -359,12 +374,6 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 		if err := m.Users.UpdateWebAuthnSignCount(rec.Username, credential.ID, credential.Authenticator.SignCount); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update passkey signature state"})
 			return
-		}
-
-		mode := webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey))
-		pendingUser := m.session.GetString(r.Context(), sessionMFAPendingUserKey)
-		if pendingUser != "" {
-			mode = webauthnLoginModeMFA
 		}
 
 		if mode == webauthnLoginModePasswordless {
