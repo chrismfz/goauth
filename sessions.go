@@ -13,7 +13,7 @@ type SessionInfo struct {
 
 // ListSessions returns all non-expired sessions from the database.
 func (m *Manager) ListSessions() ([]SessionInfo, error) {
-	rows, err := m.db.Query(
+	rows, err := m.sessionDB.Query(
 		`SELECT token, expiry FROM sessions WHERE expiry >= ? ORDER BY expiry ASC`,
 		time.Now().Unix(),
 	)
@@ -39,7 +39,7 @@ func (m *Manager) ListSessions() ([]SessionInfo, error) {
 
 // PurgeSessions deletes all expired session rows and returns the count removed.
 func (m *Manager) PurgeSessions() (int64, error) {
-	res, err := m.db.Exec(`DELETE FROM sessions WHERE expiry < ?`, time.Now().Unix())
+	res, err := m.sessionDB.Exec(`DELETE FROM sessions WHERE expiry < ?`, time.Now().Unix())
 	if err != nil {
 		return 0, fmt.Errorf("goauth: purge sessions: %w", err)
 	}
