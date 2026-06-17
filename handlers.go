@@ -276,11 +276,6 @@ func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, err
 		result.RecoveryCodesExhausted = true
 		return result, nil
 	}
-	if remainingBefore <= recoveryCodeRegenerateThreshold {
-		result.RecoveryRegenerateRequired = true
-		return result, nil
-	}
-
 	consumed, remainingAfter, err := m.Users.ConsumeRecoveryCode(username, code)
 	if errors.Is(err, ErrUserNotFound) {
 		return result, nil
