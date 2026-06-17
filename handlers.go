@@ -57,6 +57,8 @@ func actorReason(actor, target string) string {
 	return "admin_scope"
 }
 
+type securitySubjectResolver func(w http.ResponseWriter, r *http.Request, requested string) (*User, string, bool)
+
 func (m *Manager) resolveSecuritySubjectOrWriteError(w http.ResponseWriter, r *http.Request, requested string) (*User, string, bool) {
 	actor, ok := UserFromContext(r.Context())
 	if !ok || strings.TrimSpace(actor.Username) == "" {
@@ -79,9 +81,26 @@ func (m *Manager) resolveSecuritySubjectOrWriteError(w http.ResponseWriter, r *h
 	return nil, "", false
 }
 
+func (m *Manager) resolveSelfSecuritySubjectOrWriteError(w http.ResponseWriter, r *http.Request, _ string) (*User, string, bool) {
+	actor, ok := UserFromContext(r.Context())
+	if !ok || strings.TrimSpace(actor.Username) == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		return nil, "", false
+	}
+	return actor, actor.Username, true
+}
+
 // SecurityPasswordChangeHandler changes the authenticated user's password.
 // A different subject can only be targeted by callers with admin role.
 func (m *Manager) SecurityPasswordChangeHandler() http.HandlerFunc {
+	return m.securityPasswordChangeHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfSecurityPasswordChangeHandler() http.HandlerFunc {
+	return m.securityPasswordChangeHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -94,7 +113,7 @@ func (m *Manager) SecurityPasswordChangeHandler() http.HandlerFunc {
 			return
 		}
 
-		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, req.Subject)
+		actor, subject, ok := resolve(w, r, req.Subject)
 		if !ok {
 			return
 		}
@@ -137,13 +156,21 @@ func (m *Manager) SecurityPasswordChangeHandler() http.HandlerFunc {
 // SecurityFactorsHandler returns MFA/passkey status for account-security UI.
 // A different subject can only be queried by callers with admin role.
 func (m *Manager) SecurityFactorsHandler() http.HandlerFunc {
+	return m.securityFactorsHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfSecurityFactorsHandler() http.HandlerFunc {
+	return m.securityFactorsHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) securityFactorsHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		_, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -305,12 +332,20 @@ type regenerateRecoveryCodesRequest struct {
 // MFARecoveryRegenerateHandler rotates the currently authenticated user's
 // recovery codes and returns the new plaintext codes exactly once.
 func (m *Manager) MFARecoveryRegenerateHandler() http.HandlerFunc {
+	return m.mfaRecoveryRegenerateHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfMFARecoveryRegenerateHandler() http.HandlerFunc {
+	return m.mfaRecoveryRegenerateHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		actor, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -377,12 +412,20 @@ func (m *Manager) writeMFAProof(r *http.Request) {
 // TOTPEnrollStartHandler creates a fresh unverified TOTP secret and returns
 // the otpauth URI for QR-code generation.
 func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
+	return m.totpEnrollStartHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfTOTPEnrollStartHandler() http.HandlerFunc {
+	return m.totpEnrollStartHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) totpEnrollStartHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		actor, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -415,12 +458,20 @@ func (m *Manager) TOTPEnrollStartHandler() http.HandlerFunc {
 // TOTPEnrollConfirmHandler verifies one code from the newly enrolled authenticator
 // and enables TOTP MFA for the current user.
 func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
+	return m.totpEnrollConfirmHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfTOTPEnrollConfirmHandler() http.HandlerFunc {
+	return m.totpEnrollConfirmHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		actor, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -465,12 +516,20 @@ func (m *Manager) TOTPEnrollConfirmHandler() http.HandlerFunc {
 // MFADisableHandler disables all configured MFA for the current user.
 // Requires either recent MFA proof in the current session or password re-auth.
 func (m *Manager) MFADisableHandler() http.HandlerFunc {
+	return m.mfaDisableHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfMFADisableHandler() http.HandlerFunc {
+	return m.mfaDisableHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) mfaDisableHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		actor, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		actor, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -516,14 +575,31 @@ func (m *Manager) MFADisableHandler() http.HandlerFunc {
 
 // RegisterMeSecurityRoutes mounts authenticated /me/security endpoints.
 func (m *Manager) RegisterMeSecurityRoutes(mux *http.ServeMux) {
-	mux.Handle("POST /me/security/password", m.Require()(m.SecurityPasswordChangeHandler()))
-	mux.Handle("POST "+RouteMeSecurityTOTPEnrollStart, m.Require()(m.TOTPEnrollStartHandler()))
-	mux.Handle("POST /me/security/mfa/totp/enroll/confirm", m.Require()(m.TOTPEnrollConfirmHandler()))
-	mux.Handle("POST /me/security/mfa/disable", m.Require()(m.MFADisableHandler()))
-	mux.Handle("POST /me/security/recovery-codes/regenerate", m.Require()(m.MFARecoveryRegenerateHandler()))
-	mux.Handle("POST /me/security/passkeys/register/start", m.Require()(m.WebAuthnRegistrationBeginHandler()))
-	mux.Handle("POST /me/security/passkeys/register/finish", m.Require()(m.WebAuthnRegistrationFinishHandler()))
-	mux.Handle("GET /me/security/factors", m.Require()(m.SecurityFactorsHandler()))
+	mux.Handle("POST /me/security/password", m.Require()(m.selfSecurityPasswordChangeHandler()))
+	mux.Handle("POST "+RouteMeSecurityTOTPEnrollStart, m.Require()(m.selfTOTPEnrollStartHandler()))
+	mux.Handle("POST /me/security/mfa/totp/enroll/confirm", m.Require()(m.selfTOTPEnrollConfirmHandler()))
+	mux.Handle("POST /me/security/mfa/disable", m.Require()(m.selfMFADisableHandler()))
+	mux.Handle("POST /me/security/recovery-codes/regenerate", m.Require()(m.selfMFARecoveryRegenerateHandler()))
+	mux.Handle("POST /me/security/passkeys/register/start", m.Require()(m.selfWebAuthnRegistrationBeginHandler()))
+	mux.Handle("POST /me/security/passkeys/register/finish", m.Require()(m.selfWebAuthnRegistrationFinishHandler()))
+	mux.Handle("GET /me/security/factors", m.Require()(m.selfSecurityFactorsHandler()))
+}
+
+// RegisterAdminSecurityRoutes mounts admin-only account-security endpoints for
+// explicitly targeting a user by username.
+func (m *Manager) RegisterAdminSecurityRoutes(mux *http.ServeMux) {
+	adminSubject := func(w http.ResponseWriter, r *http.Request, _ string) (*User, string, bool) {
+		return m.resolveSecuritySubjectOrWriteError(w, r, r.PathValue("username"))
+	}
+
+	mux.Handle("POST /admin/users/{username}/security/password", m.Require("admin")(m.securityPasswordChangeHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/mfa/totp/enroll/start", m.Require("admin")(m.totpEnrollStartHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/mfa/totp/enroll/confirm", m.Require("admin")(m.totpEnrollConfirmHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/mfa/disable", m.Require("admin")(m.mfaDisableHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/recovery-codes/regenerate", m.Require("admin")(m.mfaRecoveryRegenerateHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/passkeys/register/start", m.Require("admin")(m.webAuthnRegistrationBeginHandlerWithResolver(adminSubject)))
+	mux.Handle("POST /admin/users/{username}/security/passkeys/register/finish", m.Require("admin")(m.webAuthnRegistrationFinishHandlerWithResolver(adminSubject)))
+	mux.Handle("GET /admin/users/{username}/security/factors", m.Require("admin")(m.securityFactorsHandlerWithResolver(adminSubject)))
 }
 
 // LoginHandler returns an http.Handler that accepts POST requests with
