@@ -126,6 +126,14 @@ func (m *Manager) consumeWebAuthnChallenge(r *http.Request, ceremony string) (*w
 }
 
 func (m *Manager) WebAuthnRegistrationBeginHandler() http.HandlerFunc {
+	return m.webAuthnRegistrationBeginHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfWebAuthnRegistrationBeginHandler() http.HandlerFunc {
+	return m.webAuthnRegistrationBeginHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) webAuthnRegistrationBeginHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -135,7 +143,7 @@ func (m *Manager) WebAuthnRegistrationBeginHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "webauthn is not configured"})
 			return
 		}
-		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		_, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
@@ -164,6 +172,14 @@ func (m *Manager) WebAuthnRegistrationBeginHandler() http.HandlerFunc {
 }
 
 func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
+	return m.webAuthnRegistrationFinishHandlerWithResolver(m.resolveSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) selfWebAuthnRegistrationFinishHandler() http.HandlerFunc {
+	return m.webAuthnRegistrationFinishHandlerWithResolver(m.resolveSelfSecuritySubjectOrWriteError)
+}
+
+func (m *Manager) webAuthnRegistrationFinishHandlerWithResolver(resolve securitySubjectResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -173,7 +189,7 @@ func (m *Manager) WebAuthnRegistrationFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "webauthn is not configured"})
 			return
 		}
-		_, subject, ok := m.resolveSecuritySubjectOrWriteError(w, r, "")
+		_, subject, ok := resolve(w, r, "")
 		if !ok {
 			return
 		}
