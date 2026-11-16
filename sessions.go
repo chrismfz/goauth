@@ -7,6 +7,8 @@ import (
 
 // SessionInfo is a lightweight view of a session row, used by the CLI.
 type SessionInfo struct {
+	// Token is the SHA-256 of the session token, as stored. It identifies a
+	// row; it cannot be used as a cookie.
 	Token  string
 	Expiry time.Time
 }

@@ -1,6 +1,7 @@
 package goauth
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	webauthnprotocol "github.com/go-webauthn/webauthn/protocol"
 	webauthnlib "github.com/go-webauthn/webauthn/webauthn"
 )
 
@@ -23,6 +25,9 @@ type webAuthnUser struct {
 	user        *User
 	userHandle  []byte
 	credentials []webauthnlib.Credential
+	// flagsKnown[i] is false for a credential stored before authenticator
+	// flags were kept.
+	flagsKnown []bool
 }
 
 func (u *webAuthnUser) WebAuthnID() []byte {
@@ -76,7 +81,7 @@ func (m *Manager) getWebAuthnUser(username string) (*webAuthnUser, error) {
 	if err != nil {
 		return nil, err
 	}
-	creds, err := m.Users.ListWebAuthnCredentials(username)
+	creds, flagsKnown, err := m.Users.listWebAuthnCredentials(username)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +89,7 @@ func (m *Manager) getWebAuthnUser(username string) (*webAuthnUser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &webAuthnUser{user: user, userHandle: handle, credentials: creds}, nil
+	return &webAuthnUser{user: user, userHandle: handle, credentials: creds, flagsKnown: flagsKnown}, nil
 }
 
 func (m *Manager) storeWebAuthnChallenge(r *http.Request, ceremony, username string, sd *webauthnlib.SessionData, ttl time.Duration) error {
@@ -143,8 +148,17 @@ func (m *Manager) webAuthnRegistrationBeginHandlerWithResolver(resolve securityS
 			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "webauthn is not configured"})
 			return
 		}
-		_, subject, ok := resolve(w, r, "")
+		actor, subject, ok := resolve(w, r, "")
 		if !ok {
+			return
+		}
+
+		// A passkey is a sign-in factor: adding one to your own account takes
+		// the same proof as removing MFA. With a session alone, whoever held
+		// it could attach their own authenticator and keep it.
+		var req mfaDisableRequest
+		_ = decodeJSONBody(w, r, &req)
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
 			return
 		}
 
@@ -199,7 +213,7 @@ func (m *Manager) webAuthnRegistrationFinishHandlerWithResolver(resolve security
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no pending passkey registration challenge"})
 			return
 		}
-		if !strings.EqualFold(rec.Username, subject) {
+		if !sameUsername(rec.Username, subject) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "challenge does not match current user"})
 			return
 		}
@@ -213,6 +227,7 @@ func (m *Manager) webAuthnRegistrationFinishHandlerWithResolver(resolve security
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load user for passkey registration"})
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		credential, err := m.webAuthn.FinishRegistration(waUser, rec.SessionData, r)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey attestation"})
@@ -248,7 +263,7 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 
 		if username == "" {
 			var req webAuthnLoginBeginRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			if err := decodeJSONBody(w, r, &req); err != nil && !errors.Is(err, io.EOF) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 				return
 			}
@@ -258,42 +273,69 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 				return
 			}
 		} else {
+			if !m.mfaPendingValid(r) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+				return
+			}
 			mode = webauthnLoginModeMFA
+		}
+
+		// Before any lookup: this endpoint takes a username from anyone.
+		if len(username) > maxUsernameLen {
+			username = username[:maxUsernameLen]
+		}
+		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
+			auditLog(m.db, LogEventRateLimit, username, ip, LogReasonTooManyUser)
+			writeTooManyAttempts(w, retryAfter, "too many login attempts — please wait before trying again")
+			return
+		}
+
+		// Without a password-verified login behind it, every refusal reads the
+		// same. The separate answers (no such user / disabled / no passkey /
+		// not enabled) told anyone which accounts exist and how they sign in.
+		refuse := func(status int, detail string) {
+			if mode == webauthnLoginModePasswordless {
+				status, detail = http.StatusUnauthorized, "passkey login is not available for this account"
+			}
+			writeJSON(w, status, map[string]string{"error": detail})
+		}
+
+		// Nothing is written for an account that is going to be refused
+		// (getWebAuthnUser creates the user handle on first use).
+		if mode == webauthnLoginModePasswordless {
+			u, err := m.Users.GetByUsername(username)
+			if err != nil && !errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not begin passkey login"})
+				return
+			}
+			if err != nil || !u.Active || !u.MFAEnabled || !strings.EqualFold(u.MFAType, "passkey") {
+				refuse(http.StatusUnauthorized, "")
+				return
+			}
 		}
 
 		waUser, err := m.getWebAuthnUser(username)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid login request"})
+				refuse(http.StatusUnauthorized, "invalid login request")
 				return
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not begin passkey login"})
 			return
 		}
 		if !waUser.user.Active {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "account is disabled"})
+			refuse(http.StatusForbidden, "account is disabled")
 			return
 		}
 		if len(waUser.credentials) == 0 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no passkey enrolled for user"})
+			refuse(http.StatusUnauthorized, "no passkey enrolled for user")
 			return
 		}
 		if mode == webauthnLoginModePasswordless {
 			if !waUser.user.MFAEnabled || !strings.EqualFold(waUser.user.MFAType, "passkey") {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "passkey-first login is not enabled for this user"})
+				refuse(http.StatusUnauthorized, "")
 				return
 			}
-		}
-
-		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
-			secs := int(retryAfter / time.Second)
-			if secs < 1 {
-				secs = 1
-			}
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			auditLog(m.db, LogEventRateLimit, username, ip, LogReasonTooManyUser)
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts — please wait before trying again"})
-			return
 		}
 
 		options, sd, err := m.webAuthn.BeginLogin(waUser)
@@ -310,16 +352,93 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 	}
 }
 
-func (m *Manager) finalizeAuthenticatedSession(r *http.Request, user *User) error {
+// mfaPendingValid reports whether the session's password-verified MFA login
+// can still be completed, and clears it (with any passkey ceremony begun
+// under it) when it cannot:
+//
+//   - it is inside its deadline. The TOTP verify handler always enforced that;
+//     the passkey path did not, so a password-verified session stayed one
+//     passkey touch away from a login for the whole session lifetime;
+//   - the user's sessions were not revoked since the password step (a password
+//     reset or a disable in between ends the half-finished login too).
+func (m *Manager) mfaPendingValid(r *http.Request) bool {
+	ctx := r.Context()
+	username := m.session.GetString(ctx, sessionMFAPendingUserKey)
+	raw := m.session.GetString(ctx, sessionMFAPendingDeadlineKey)
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
+	ok := username != "" && raw != "" && err == nil && !time.Now().After(deadline)
+	if ok {
+		st, found, serr := m.Users.sessionStateFor(username, true)
+		ok = serr == nil && found && st.Active && st.Epoch == m.session.GetInt64(ctx, sessionMFAPendingEpochKey)
+	}
+	if !ok {
+		m.session.Remove(ctx, sessionMFAPendingUserKey)
+		m.session.Remove(ctx, sessionMFAPendingDeadlineKey)
+		m.session.Remove(ctx, sessionMFAPendingEpochKey)
+		m.session.Remove(ctx, sessionWebAuthnLoginModeKey)
+		m.session.Remove(ctx, sessionWebAuthnAuthChallengeIDKey)
+	}
+	return ok
+}
+
+// finalizeAuthenticatedSession turns the current session into a logged-in one
+// for user: new token (no session fixation), identity, and the user's current
+// session epoch, which Require compares on every request. mfaVerified says
+// whether a second factor was just checked; a proof left behind by an earlier
+// login in the same session is dropped otherwise.
+func (m *Manager) finalizeAuthenticatedSession(r *http.Request, user *User, mfaVerified bool) error {
+	st, found, err := m.Users.sessionStateFor(user.Username, true)
+	if err != nil {
+		return err
+	}
+	if !found || !st.Active {
+		return ErrUserInactive
+	}
 	if err := m.session.RenewToken(r.Context()); err != nil {
 		return err
 	}
-	rolesJSON, _ := json.Marshal(user.Roles)
-	m.session.Put(r.Context(), sessionUsernameKey, user.Username)
+	rolesJSON, _ := json.Marshal(st.Roles)
+	m.session.Put(r.Context(), sessionUsernameKey, st.Username)
 	m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
+	m.session.Put(r.Context(), sessionEpochKey, st.Epoch)
 	m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 	m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+	m.session.Remove(r.Context(), sessionMFAPendingEpochKey)
 	m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+	if mfaVerified {
+		m.writeMFAProof(r)
+	} else {
+		m.session.Remove(r.Context(), sessionMFAVerifiedAtKey)
+	}
+	return nil
+}
+
+// KeepSession keeps the current session logged in after a change that ended
+// its user's sessions. Call it right after Users.SetPassword when a user
+// changed their OWN password (and you verified the current one), or that user
+// is logged out where they did it. The session gets a new token.
+func (m *Manager) KeepSession(r *http.Request) error {
+	username := m.session.GetString(r.Context(), sessionUsernameKey)
+	if username == "" {
+		return ErrUserNotFound
+	}
+	return m.adoptCurrentEpoch(r, username)
+}
+
+// adoptCurrentEpoch keeps the current session alive across a change that
+// ended the user's sessions (their own password change).
+func (m *Manager) adoptCurrentEpoch(r *http.Request, username string) error {
+	st, found, err := m.Users.sessionStateFor(username, true)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrUserNotFound
+	}
+	if err := m.session.RenewToken(r.Context()); err != nil {
+		return err
+	}
+	m.session.Put(r.Context(), sessionEpochKey, st.Epoch)
 	return nil
 }
 
@@ -344,6 +463,16 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "passkey login challenge expired"})
 			return
 		}
+		// A ceremony begun as the second factor of a password login is only
+		// good while that login is. The mode alone used to carry it: once the
+		// pending login had been cleared (expired, or refused elsewhere), the
+		// passkey still finished it.
+		if webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey)) == webauthnLoginModeMFA &&
+			m.session.GetString(r.Context(), sessionMFAPendingUserKey) == "" {
+			m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+			return
+		}
 
 		waUser, err := m.getWebAuthnUser(rec.Username)
 		if err != nil {
@@ -354,7 +483,12 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 		mode := webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey))
 		pendingUser := m.session.GetString(r.Context(), sessionMFAPendingUserKey)
 		if pendingUser != "" {
-			if !strings.EqualFold(pendingUser, rec.Username) {
+			if !m.mfaPendingValid(r) {
+				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+				return
+			}
+			if !sameUsername(pendingUser, rec.Username) {
 				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
 				m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 				m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
@@ -365,13 +499,30 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			mode = webauthnLoginModeMFA
 		}
 
-		credential, err := m.webAuthn.FinishLogin(waUser, rec.SessionData, r)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		parsed, err := webauthnprotocol.ParseCredentialRequestResponse(r)
 		if err != nil {
 			auditLog(m.db, LogEventFail, rec.Username, ip, "passkey_assertion_failed")
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey assertion"})
 			return
 		}
-		if err := m.Users.UpdateWebAuthnSignCount(rec.Username, credential.ID, credential.Authenticator.SignCount); err != nil {
+		// The library refuses an assertion whose "backup eligible" flag differs
+		// from the stored credential's. Flags were not stored at first, so a
+		// synced passkey (iCloud, Google) registered then reads as "not
+		// eligible" and could never log in. For such a row, take the flag from
+		// this assertion once; it is stored below and checked from then on.
+		for i := range waUser.credentials {
+			if !waUser.flagsKnown[i] && bytes.Equal(waUser.credentials[i].ID, parsed.RawID) {
+				waUser.credentials[i].Flags.BackupEligible = parsed.Response.AuthenticatorData.Flags.HasBackupEligible()
+			}
+		}
+		credential, err := m.webAuthn.ValidateLogin(waUser, rec.SessionData, parsed)
+		if err != nil {
+			auditLog(m.db, LogEventFail, rec.Username, ip, "passkey_assertion_failed")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey assertion"})
+			return
+		}
+		if err := m.Users.recordWebAuthnLogin(rec.Username, credential); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update passkey signature state"})
 			return
 		}
@@ -383,12 +534,11 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			}
 		}
 
-		if err := m.finalizeAuthenticatedSession(r, waUser.user); err != nil {
+		if err := m.finalizeAuthenticatedSession(r, waUser.user, mode == webauthnLoginModeMFA); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
 			return
 		}
 		if mode == webauthnLoginModeMFA {
-			m.writeMFAProof(r)
 			auditLog(m.db, LogEventSuccess, waUser.user.Username, ip, "mfa_passkey_verified")
 		} else {
 			auditLog(m.db, LogEventSuccess, waUser.user.Username, ip, "passkey_passwordless")

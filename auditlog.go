@@ -17,6 +17,7 @@ const (
 	LogEventMFADisable        = "MFA_DISABLE"
 	LogEventMFAReset          = "MFA_RESET"
 	LogEventMFARecoveryRotate = "MFA_RECOVERY_ROTATE"
+	LogEventPasswordChange    = "PASSWORD_CHANGE"
 )
 
 // LogReason constants for the auth_log.reason column.

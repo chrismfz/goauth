@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/pquerna/otp/totp"
 )
 
 // loginRequest is the JSON body expected by LoginHandler.
@@ -51,7 +50,7 @@ const (
 )
 
 func actorReason(actor, target string) string {
-	if strings.EqualFold(actor, target) {
+	if sameUsername(actor, target) {
 		return "self_service"
 	}
 	return "admin_scope"
@@ -70,7 +69,7 @@ func (m *Manager) resolveSecuritySubjectOrWriteError(w http.ResponseWriter, r *h
 	if requested == "" {
 		requested = strings.TrimSpace(r.URL.Query().Get("subject"))
 	}
-	if requested == "" || strings.EqualFold(requested, actor.Username) {
+	if requested == "" || sameUsername(requested, actor.Username) {
 		return actor, actor.Username, true
 	}
 	if hasAnyRole(actor.Roles, []string{"admin"}) {
@@ -88,6 +87,55 @@ func (m *Manager) resolveSelfSecuritySubjectOrWriteError(w http.ResponseWriter, 
 		return nil, "", false
 	}
 	return actor, actor.Username, true
+}
+
+// writeTooManyAttempts answers 429 with a Retry-After header.
+func writeTooManyAttempts(w http.ResponseWriter, retryAfter time.Duration, msg string) {
+	secs := int(retryAfter / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+	writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": msg})
+}
+
+// checkPassword verifies subject's password for an already logged-in caller
+// and writes the error response when it does not hold. These checks are rate
+// limited like a login: an open session must not be a place to guess the
+// password without limit.
+func (m *Manager) checkPassword(w http.ResponseWriter, r *http.Request, subject, password, wrongMsg string) bool {
+	if allowed, retryAfter := m.reauthRL.Allow(clientIP(r), subject); !allowed {
+		auditLog(m.db, LogEventRateLimit, subject, clientIP(r), "too_many_reauth_attempts")
+		writeTooManyAttempts(w, retryAfter, "too many attempts — please wait before trying again")
+		return false
+	}
+	if len(password) > maxPasswordLen {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": wrongMsg})
+		return false
+	}
+	if _, err := m.Users.Authenticate(subject, password); err != nil {
+		auditLog(m.db, LogEventFail, subject, clientIP(r), "reauth_bad_password")
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": wrongMsg})
+		return false
+	}
+	m.reauthRL.ResetUser(subject)
+	return true
+}
+
+// reauthenticate guards a change to the caller's own sign-in factors: it
+// passes on a recent MFA proof in this session, or else on the password.
+// An admin acting on another user is not asked (the admin role is the proof).
+func (m *Manager) reauthenticate(w http.ResponseWriter, r *http.Request, actor *User, subject, password string) bool {
+	if !sameUsername(actor.Username, subject) || m.hasRecentMFAProof(r) {
+		return true
+	}
+	if password == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "re-authentication required (password or recent MFA proof)",
+		})
+		return false
+	}
+	return m.checkPassword(w, r, subject, password, "invalid password")
 }
 
 // SecurityPasswordChangeHandler changes the authenticated user's password.
@@ -108,7 +156,7 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 		}
 
 		var req passwordChangeRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -118,11 +166,24 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 			return
 		}
 
-		requireCurrentPassword := strings.EqualFold(actor.Username, subject) || !hasAnyRole(actor.Roles, []string{"admin"})
-		req.CurrentPassword = strings.TrimSpace(req.CurrentPassword)
-		req.NewPassword = strings.TrimSpace(req.NewPassword)
+		// Passwords are taken as typed. They used to be trimmed here but not
+		// at login, so one set with a leading or trailing space never worked.
+		self := sameUsername(actor.Username, subject)
+		requireCurrentPassword := self || !hasAnyRole(actor.Roles, []string{"admin"})
 		if req.NewPassword == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_password is required"})
+			return
+		}
+		if len(req.NewPassword) < m.cfg.MinPasswordLength {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("new_password must be at least %d characters", m.cfg.MinPasswordLength),
+			})
+			return
+		}
+		if len(req.NewPassword) > maxPasswordLen {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("new_password must be at most %d bytes", maxPasswordLen),
+			})
 			return
 		}
 		if requireCurrentPassword {
@@ -130,8 +191,7 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "current_password is required"})
 				return
 			}
-			if _, err := m.Users.Authenticate(subject, req.CurrentPassword); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid current_password"})
+			if !m.checkPassword(w, r, subject, req.CurrentPassword, "invalid current_password") {
 				return
 			}
 		}
@@ -143,6 +203,16 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update password"})
 			return
+		}
+		auditLogWithContext(m.db, LogEventPasswordChange, subject, clientIP(r), actorReason(actor.Username, subject), actor.Username, subject, r.Host, "")
+
+		// SetPassword ended every session of the user. The one that just
+		// proved the old password carries on, under a new token.
+		if self {
+			if err := m.adoptCurrentEpoch(r, subject); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
+				return
+			}
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -211,23 +281,50 @@ func (m *Manager) securityFactorsHandlerWithResolver(resolve securitySubjectReso
 }
 
 // clientIP extracts the real client IP for audit logging and rate limiting.
-// Trusts X-Forwarded-For only when the direct connection is from loopback.
+//
+// X-Forwarded-For is trusted only when the direct connection is from loopback
+// (a local reverse proxy), and then only its LAST entry: that is the one the
+// proxy itself appended. Everything to its left was sent by the client. The
+// first entry used to be taken, so a client behind a proxy that appends
+// (nginx's $proxy_add_x_forwarded_for) chose its own address, and with it a
+// fresh per-IP rate-limit bucket on every request.
 func clientIP(r *http.Request) string {
-	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	// strip brackets from IPv6
 	host = strings.Trim(host, "[]")
-	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			first := strings.TrimSpace(strings.Split(fwd, ",")[0])
-			if first != "" {
-				return first
-			}
-		}
+	direct := net.ParseIP(host)
+	if direct == nil || !direct.IsLoopback() {
+		return host
+	}
+	values := r.Header.Values("X-Forwarded-For")
+	if len(values) == 0 {
+		return host
+	}
+	parts := strings.Split(values[len(values)-1], ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	if ip := net.ParseIP(last); ip != nil {
+		return ip.String()
 	}
 	return host
+}
+
+// maxRequestBody caps every JSON body the handlers read. The largest
+// legitimate one is a WebAuthn attestation, a few KiB.
+const maxRequestBody = 64 << 10
+
+// Longer credentials are refused before they reach Argon2 or the rate
+// limiter's map.
+const (
+	maxUsernameLen = 255
+	maxPasswordLen = 1024
+)
+
+// decodeJSONBody decodes a size-capped JSON body into v.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
 func mfaMethods(user *User) []string {
@@ -276,9 +373,16 @@ func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, err
 			if err != nil {
 				return result, fmt.Errorf("decrypt totp secret: %w", err)
 			}
-			if totp.Validate(code, secret) {
-				result.OK = true
-				result.Method = "totp"
+			if step, ok := matchTOTPStep(code, secret, time.Now()); ok {
+				fresh, err := m.Users.consumeTOTPStep(username, step)
+				if err != nil {
+					return result, err
+				}
+				if fresh {
+					result.OK = true
+					result.Method = "totp"
+				}
+				// A replayed code is simply a wrong code.
 				return result, nil
 			}
 		}
@@ -300,7 +404,9 @@ func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, err
 	}
 	result.RecoveryCodesRemaining = remainingBefore
 	if remainingBefore == 0 {
-		result.RecoveryCodesExhausted = true
+		// Only when a recovery code was asked for by name. With no method, a
+		// wrong TOTP code used to end here as "recovery codes exhausted".
+		result.RecoveryCodesExhausted = method == "recovery_code"
 		return result, nil
 	}
 	consumed, remainingAfter, err := m.Users.ConsumeRecoveryCode(username, code)
@@ -351,20 +457,10 @@ func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubje
 		}
 
 		var req regenerateRecoveryCodesRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		req.Password = strings.TrimSpace(req.Password)
+		_ = decodeJSONBody(w, r, &req)
 
-		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
-			if req.Password == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{
-					"error": "re-authentication required (password or recent MFA proof)",
-				})
-				return
-			}
-			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
-				return
-			}
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
+			return
 		}
 
 		auditCtx := AdminAuditContext{
@@ -383,7 +479,9 @@ func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubje
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not regenerate recovery codes"})
 			return
 		}
-		m.writeMFAProof(r)
+		// (No MFA proof is written here: the caller proved one to get this far,
+		// and an admin rotating someone else's codes proved nothing about
+		// their own account.)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"codes":                codes,
 			"total_codes":          len(codes),
@@ -427,6 +525,17 @@ func (m *Manager) totpEnrollStartHandlerWithResolver(resolve securitySubjectReso
 		}
 		actor, subject, ok := resolve(w, r, "")
 		if !ok {
+			return
+		}
+
+		// Adding or replacing your own second factor takes the same proof as
+		// removing it. With a session alone, whoever held it could enroll
+		// their own authenticator: on an account without MFA that locks the
+		// owner out, and the confirmation then counted as an MFA proof for
+		// everything else guarded this way.
+		var req mfaDisableRequest
+		_ = decodeJSONBody(w, r, &req)
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
 			return
 		}
 
@@ -476,7 +585,7 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			return
 		}
 		var req totpEnrollConfirmRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -487,6 +596,13 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			IP:     clientIP(r),
 			Host:   r.Host,
 			Reason: actorReason(actor.Username, subject),
+		}
+		// A pending secret is guessable like any 6-digit code: same budget as
+		// a login's second factor.
+		if allowed, retryAfter := m.mfaRL.Allow(clientIP(r), subject); !allowed {
+			auditLog(m.db, LogEventRateLimit, subject, clientIP(r), "too_many_mfa_attempts")
+			writeTooManyAttempts(w, retryAfter, "too many attempts — please wait before trying again")
+			return
 		}
 		err := m.AdminConfirmTOTPEnrollment(auditCtx, req.Code)
 		if err != nil {
@@ -505,7 +621,10 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not enable TOTP MFA"})
 			return
 		}
-		m.writeMFAProof(r)
+		m.mfaRL.ResetUser(subject)
+		if sameUsername(actor.Username, subject) {
+			m.writeMFAProof(r)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"mfa_enabled": true,
 			"mfa_type":    "totp",
@@ -535,20 +654,10 @@ func (m *Manager) mfaDisableHandlerWithResolver(resolve securitySubjectResolver)
 		}
 
 		var req mfaDisableRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		req.Password = strings.TrimSpace(req.Password)
+		_ = decodeJSONBody(w, r, &req)
 
-		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
-			if req.Password == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{
-					"error": "re-authentication required (password or recent MFA proof)",
-				})
-				return
-			}
-			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
-				return
-			}
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
+			return
 		}
 
 		auditCtx := AdminAuditContext{
@@ -624,8 +733,16 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 		ip := clientIP(r)
 
 		var req loginRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		// The limiter key and the audit row are attacker-chosen: bound them.
+		if len(req.Username) > maxUsernameLen || len(req.Password) > maxPasswordLen {
+			m.rl.Allow(ip, "")
+			auditLog(m.db, LogEventFail, req.Username[:min(len(req.Username), maxUsernameLen)], ip, LogReasonBadCredentials)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 			return
 		}
 
@@ -668,6 +785,9 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 			deadline := time.Now().Add(5 * time.Minute)
 			m.session.Put(r.Context(), sessionMFAPendingUserKey, user.Username)
 			m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, deadline.Format(time.RFC3339Nano))
+			if st, found, err := m.Users.sessionStateFor(user.Username, true); err == nil && found {
+				m.session.Put(r.Context(), sessionMFAPendingEpochKey, st.Epoch)
+			}
 			auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_pending")
 			writeJSON(w, http.StatusOK, map[string]any{
 				"mfa_required": true,
@@ -677,17 +797,11 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 		}
 
 		// ── Session ───────────────────────────────────────────────────────────
-		// Rotate session ID on login to prevent session fixation.
-		if err := m.session.RenewToken(r.Context()); err != nil {
+		// Rotates the session ID on login to prevent session fixation.
+		if err := m.finalizeAuthenticatedSession(r, user, false); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
 			return
 		}
-
-		rolesJSON, _ := json.Marshal(user.Roles)
-		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
-		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
-		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
-		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
 
 		auditLog(m.db, LogEventSuccess, user.Username, ip, "")
 
@@ -735,7 +849,7 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 		}
 
 		var req loginMFAVerifyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -748,20 +862,14 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			return
 		}
 
-		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
-			reason := LogReasonTooManyIP
-			if username != "" {
-				reason = LogReasonTooManyUser
-			}
-			auditLog(m.db, LogEventRateLimit, username, ip, reason)
-			secs := int(retryAfter / time.Second)
-			if secs < 1 {
-				secs = 1
-			}
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{
-				"error": "too many MFA attempts — please wait before trying again",
-			})
+		if !m.mfaPendingValid(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+			return
+		}
+
+		if allowed, retryAfter := m.mfaRL.Allow(ip, username); !allowed {
+			auditLog(m.db, LogEventRateLimit, username, ip, "too_many_mfa_attempts")
+			writeTooManyAttempts(w, retryAfter, "too many MFA attempts — please wait before trying again")
 			return
 		}
 
@@ -818,17 +926,11 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			return
 		}
 
-		if err := m.session.RenewToken(r.Context()); err != nil {
+		if err := m.finalizeAuthenticatedSession(r, user, true); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
 			return
 		}
-
-		rolesJSON, _ := json.Marshal(user.Roles)
-		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
-		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
-		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
-		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
-		m.writeMFAProof(r)
+		m.mfaRL.ResetUser(username)
 		reason := "mfa_verified"
 		if verify.Method == "recovery_code" {
 			reason = LogReasonMFARecoveryUsed

@@ -93,6 +93,17 @@ func runAuthMigrations(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS auth_log_event_ts_idx ON auth_log(event, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS auth_log_actor_ts_idx ON auth_log(actor, ts DESC)`,
 		`CREATE INDEX IF NOT EXISTS auth_log_target_ts_idx ON auth_log(target, ts DESC)`,
+		// A re-enrollment waits here until it is confirmed; the active secret
+		// keeps working meanwhile.
+		`ALTER TABLE users ADD COLUMN totp_pending_secret_enc TEXT`,
+		// Last accepted TOTP time step: a code is good for one login.
+		`ALTER TABLE users ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0`,
+		// Bumped to end every session of the user. A session carries the value
+		// it was created under.
+		`ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0`,
+		// Authenticator flags (UP=1, UV=2, BE=4, BS=8). NULL = stored before
+		// flags were kept.
+		`ALTER TABLE webauthn_credentials ADD COLUMN flags INTEGER`,
 	}
 
 	for _, s := range additiveStmts {
