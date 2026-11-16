@@ -213,7 +213,7 @@ func (m *Manager) webAuthnRegistrationFinishHandlerWithResolver(resolve security
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no pending passkey registration challenge"})
 			return
 		}
-		if !strings.EqualFold(rec.Username, subject) {
+		if !sameUsername(rec.Username, subject) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "challenge does not match current user"})
 			return
 		}
@@ -300,6 +300,20 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 			writeJSON(w, status, map[string]string{"error": detail})
 		}
 
+		// Nothing is written for an account that is going to be refused
+		// (getWebAuthnUser creates the user handle on first use).
+		if mode == webauthnLoginModePasswordless {
+			u, err := m.Users.GetByUsername(username)
+			if err != nil && !errors.Is(err, ErrUserNotFound) {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not begin passkey login"})
+				return
+			}
+			if err != nil || !u.Active || !u.MFAEnabled || !strings.EqualFold(u.MFAType, "passkey") {
+				refuse(http.StatusUnauthorized, "")
+				return
+			}
+		}
+
 		waUser, err := m.getWebAuthnUser(username)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
@@ -338,20 +352,33 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 	}
 }
 
-// mfaPendingValid reports whether the session's password-verified MFA login is
-// still inside its deadline, and clears it when it is not. The TOTP verify
-// handler always enforced the deadline; the passkey path did not, so a
-// password-verified session stayed one passkey touch away from a login for the
-// whole session lifetime.
+// mfaPendingValid reports whether the session's password-verified MFA login
+// can still be completed, and clears it (with any passkey ceremony begun
+// under it) when it cannot:
+//
+//   - it is inside its deadline. The TOTP verify handler always enforced that;
+//     the passkey path did not, so a password-verified session stayed one
+//     passkey touch away from a login for the whole session lifetime;
+//   - the user's sessions were not revoked since the password step (a password
+//     reset or a disable in between ends the half-finished login too).
 func (m *Manager) mfaPendingValid(r *http.Request) bool {
-	raw := m.session.GetString(r.Context(), sessionMFAPendingDeadlineKey)
+	ctx := r.Context()
+	username := m.session.GetString(ctx, sessionMFAPendingUserKey)
+	raw := m.session.GetString(ctx, sessionMFAPendingDeadlineKey)
 	deadline, err := time.Parse(time.RFC3339Nano, raw)
-	if raw == "" || err != nil || time.Now().After(deadline) {
-		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
-		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
-		return false
+	ok := username != "" && raw != "" && err == nil && !time.Now().After(deadline)
+	if ok {
+		st, found, serr := m.Users.sessionStateFor(username, true)
+		ok = serr == nil && found && st.Active && st.Epoch == m.session.GetInt64(ctx, sessionMFAPendingEpochKey)
 	}
-	return true
+	if !ok {
+		m.session.Remove(ctx, sessionMFAPendingUserKey)
+		m.session.Remove(ctx, sessionMFAPendingDeadlineKey)
+		m.session.Remove(ctx, sessionMFAPendingEpochKey)
+		m.session.Remove(ctx, sessionWebAuthnLoginModeKey)
+		m.session.Remove(ctx, sessionWebAuthnAuthChallengeIDKey)
+	}
+	return ok
 }
 
 // finalizeAuthenticatedSession turns the current session into a logged-in one
@@ -376,6 +403,7 @@ func (m *Manager) finalizeAuthenticatedSession(r *http.Request, user *User, mfaV
 	m.session.Put(r.Context(), sessionEpochKey, st.Epoch)
 	m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 	m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+	m.session.Remove(r.Context(), sessionMFAPendingEpochKey)
 	m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
 	if mfaVerified {
 		m.writeMFAProof(r)
@@ -383,6 +411,18 @@ func (m *Manager) finalizeAuthenticatedSession(r *http.Request, user *User, mfaV
 		m.session.Remove(r.Context(), sessionMFAVerifiedAtKey)
 	}
 	return nil
+}
+
+// KeepSession keeps the current session logged in after a change that ended
+// its user's sessions. Call it right after Users.SetPassword when a user
+// changed their OWN password (and you verified the current one), or that user
+// is logged out where they did it. The session gets a new token.
+func (m *Manager) KeepSession(r *http.Request) error {
+	username := m.session.GetString(r.Context(), sessionUsernameKey)
+	if username == "" {
+		return ErrUserNotFound
+	}
+	return m.adoptCurrentEpoch(r, username)
 }
 
 // adoptCurrentEpoch keeps the current session alive across a change that
@@ -423,6 +463,16 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "passkey login challenge expired"})
 			return
 		}
+		// A ceremony begun as the second factor of a password login is only
+		// good while that login is. The mode alone used to carry it: once the
+		// pending login had been cleared (expired, or refused elsewhere), the
+		// passkey still finished it.
+		if webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey)) == webauthnLoginModeMFA &&
+			m.session.GetString(r.Context(), sessionMFAPendingUserKey) == "" {
+			m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+			return
+		}
 
 		waUser, err := m.getWebAuthnUser(rec.Username)
 		if err != nil {
@@ -438,7 +488,7 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
 				return
 			}
-			if !strings.EqualFold(pendingUser, rec.Username) {
+			if !sameUsername(pendingUser, rec.Username) {
 				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
 				m.session.Remove(r.Context(), sessionMFAPendingUserKey)
 				m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)

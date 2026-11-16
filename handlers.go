@@ -50,7 +50,7 @@ const (
 )
 
 func actorReason(actor, target string) string {
-	if strings.EqualFold(actor, target) {
+	if sameUsername(actor, target) {
 		return "self_service"
 	}
 	return "admin_scope"
@@ -69,7 +69,7 @@ func (m *Manager) resolveSecuritySubjectOrWriteError(w http.ResponseWriter, r *h
 	if requested == "" {
 		requested = strings.TrimSpace(r.URL.Query().Get("subject"))
 	}
-	if requested == "" || strings.EqualFold(requested, actor.Username) {
+	if requested == "" || sameUsername(requested, actor.Username) {
 		return actor, actor.Username, true
 	}
 	if hasAnyRole(actor.Roles, []string{"admin"}) {
@@ -126,7 +126,7 @@ func (m *Manager) checkPassword(w http.ResponseWriter, r *http.Request, subject,
 // passes on a recent MFA proof in this session, or else on the password.
 // An admin acting on another user is not asked (the admin role is the proof).
 func (m *Manager) reauthenticate(w http.ResponseWriter, r *http.Request, actor *User, subject, password string) bool {
-	if !strings.EqualFold(actor.Username, subject) || m.hasRecentMFAProof(r) {
+	if !sameUsername(actor.Username, subject) || m.hasRecentMFAProof(r) {
 		return true
 	}
 	if password == "" {
@@ -168,7 +168,7 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 
 		// Passwords are taken as typed. They used to be trimmed here but not
 		// at login, so one set with a leading or trailing space never worked.
-		self := strings.EqualFold(actor.Username, subject)
+		self := sameUsername(actor.Username, subject)
 		requireCurrentPassword := self || !hasAnyRole(actor.Roles, []string{"admin"})
 		if req.NewPassword == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_password is required"})
@@ -404,7 +404,9 @@ func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, err
 	}
 	result.RecoveryCodesRemaining = remainingBefore
 	if remainingBefore == 0 {
-		result.RecoveryCodesExhausted = true
+		// Only when a recovery code was asked for by name. With no method, a
+		// wrong TOTP code used to end here as "recovery codes exhausted".
+		result.RecoveryCodesExhausted = method == "recovery_code"
 		return result, nil
 	}
 	consumed, remainingAfter, err := m.Users.ConsumeRecoveryCode(username, code)
@@ -477,7 +479,9 @@ func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubje
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not regenerate recovery codes"})
 			return
 		}
-		m.writeMFAProof(r)
+		// (No MFA proof is written here: the caller proved one to get this far,
+		// and an admin rotating someone else's codes proved nothing about
+		// their own account.)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"codes":                codes,
 			"total_codes":          len(codes),
@@ -524,17 +528,14 @@ func (m *Manager) totpEnrollStartHandlerWithResolver(resolve securitySubjectReso
 			return
 		}
 
-		// Replacing a working second factor needs the same proof as removing
-		// it: the confirmed secret takes over from the active one. A first
-		// enrollment (no MFA yet) needs none, as before.
+		// Adding or replacing your own second factor takes the same proof as
+		// removing it. With a session alone, whoever held it could enroll
+		// their own authenticator: on an account without MFA that locks the
+		// owner out, and the confirmation then counted as an MFA proof for
+		// everything else guarded this way.
 		var req mfaDisableRequest
 		_ = decodeJSONBody(w, r, &req)
-		target, err := m.Users.GetByUsername(subject)
-		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
-			return
-		}
-		if target.MFAEnabled && !m.reauthenticate(w, r, actor, subject, req.Password) {
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
 			return
 		}
 
@@ -596,6 +597,13 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			Host:   r.Host,
 			Reason: actorReason(actor.Username, subject),
 		}
+		// A pending secret is guessable like any 6-digit code: same budget as
+		// a login's second factor.
+		if allowed, retryAfter := m.mfaRL.Allow(clientIP(r), subject); !allowed {
+			auditLog(m.db, LogEventRateLimit, subject, clientIP(r), "too_many_mfa_attempts")
+			writeTooManyAttempts(w, retryAfter, "too many attempts — please wait before trying again")
+			return
+		}
 		err := m.AdminConfirmTOTPEnrollment(auditCtx, req.Code)
 		if err != nil {
 			if errors.Is(err, ErrUserNotFound) {
@@ -613,7 +621,10 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not enable TOTP MFA"})
 			return
 		}
-		m.writeMFAProof(r)
+		m.mfaRL.ResetUser(subject)
+		if sameUsername(actor.Username, subject) {
+			m.writeMFAProof(r)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"mfa_enabled": true,
 			"mfa_type":    "totp",
@@ -774,6 +785,9 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 			deadline := time.Now().Add(5 * time.Minute)
 			m.session.Put(r.Context(), sessionMFAPendingUserKey, user.Username)
 			m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, deadline.Format(time.RFC3339Nano))
+			if st, found, err := m.Users.sessionStateFor(user.Username, true); err == nil && found {
+				m.session.Put(r.Context(), sessionMFAPendingEpochKey, st.Epoch)
+			}
 			auditLog(m.db, LogEventSuccess, user.Username, ip, "mfa_pending")
 			writeJSON(w, http.StatusOK, map[string]any{
 				"mfa_required": true,
@@ -845,6 +859,11 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 				"error":             "invalid MFA method",
 				"supported_methods": []string{"totp", "recovery_code"},
 			})
+			return
+		}
+
+		if !m.mfaPendingValid(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
 			return
 		}
 

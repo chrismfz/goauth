@@ -185,7 +185,7 @@ This section documents a practical split between **self-service user flows** and
 |---|---|---|---|---|
 | `/login` | `POST` | No | Self | `200` success session, or `200` `{ "mfa_required": true }`, `401` invalid credentials, `429` rate limited |
 | `/login/mfa/verify` | `POST` | Pending login challenge | Self | `200` session established, `400` bad payload/method, `401` invalid MFA proof |
-| `/me/security/mfa/totp/enroll/start` | `POST` | Session; if MFA is already on, also `{"password": "..."}` or a recent MFA proof | Self | `200` enrollment payload (`issuer`, `account`, `otpauth_uri`), `401` unauthenticated or re-authentication required, `429` rate limited |
+| `/me/security/mfa/totp/enroll/start` | `POST` | Session + `{"password": "..."}` or a recent MFA proof | Self | `200` enrollment payload (`issuer`, `account`, `otpauth_uri`), `401` unauthenticated or re-authentication required, `429` rate limited |
 | `/me/security/mfa/totp/enroll/confirm` | `POST` | Session | Self | `200` MFA enabled + recovery codes, `400` invalid code, `401` unauthenticated |
 | `/me/security/recovery-codes/regenerate` | `POST` | Session + successful MFA step-up (recommended) | Self | `200` new recovery codes (shown once), `401` unauthenticated, `403` policy blocked |
 | `/me` | `GET` | Session | Self | `200` current user profile, `401` unauthenticated |
@@ -197,10 +197,12 @@ This section documents a practical split between **self-service user flows** and
 **Re-authentication.** Changing your own sign-in factors takes more than a
 session: the body carries `{"password": "..."}`, unless the session proved a
 second factor in the last 10 minutes. This applies to `mfa/disable`,
-`recovery-codes/regenerate`, `passkeys/register/start`, and to
-`mfa/totp/enroll/start` when MFA is already enabled (a first enrollment needs
-only the session). Without it the answer is `401` with
-`re-authentication required (password or recent MFA proof)`.
+`recovery-codes/regenerate`, `passkeys/register/start` and
+`mfa/totp/enroll/start` (a first enrollment included: your UI must send the
+password with it). Without it the answer is `401` with
+`re-authentication required (password or recent MFA proof)`. An admin acting
+on another user through the admin routes is not asked, and earns no proof for
+their own account by doing so.
 
 **Enrollment does not interrupt MFA.** `enroll/start` stores the new secret as
 pending. The current authenticator keeps working until `enroll/confirm`
@@ -974,7 +976,7 @@ Three independent sliding-window limiters, no configuration required:
 | What | Per IP | Per username | Notes |
 |---|---|---|---|
 | Password login (`LoginHandler`, passkey login begin) | 10 / 60s | 20 / 10min | |
-| MFA code (`LoginMFAVerifyHandler`) | 10 / 60s | 5 / 15min | cleared when the user gets in |
+| MFA code (`LoginMFAVerifyHandler`, TOTP enroll confirm) | 10 / 60s | 5 / 15min | cleared when the code is right |
 | Password re-check inside a session (change password, disable MFA, ...) | 10 / 60s | 10 / 10min | cleared on a correct password |
 
 When a limit is breached the handler returns `429 Too Many Requests`
@@ -1008,9 +1010,10 @@ A session is checked against the user table on every request (`Require` and
 
 A change made by another process (the CLI) reaches a running server within
 about 5 seconds. A user changing their own password through the
-password-change handler keeps the session they did it from; if your
-application calls `Users.SetPassword` directly, that user is logged out
-everywhere, including where they did it.
+password-change handler keeps the session they did it from. If your
+application calls `Users.SetPassword` directly for a user changing their own
+password, call `auth.KeepSession(r)` right after it, or that user is logged
+out where they did it as well.
 
 Session tokens are stored as SHA-256. `ListSessions()` returns those hashes:
 they identify a row and cannot be used as a cookie. Rows written by an older

@@ -61,6 +61,25 @@ type UserStore struct {
 	state   map[string]cachedSessionState
 }
 
+// foldUsername lowercases ASCII letters only, which is exactly how the users
+// table compares names (SQLite NOCASE). Unicode folding would be wider than
+// the database: "kate" and "\u212Aate" (Kelvin sign) are two different rows,
+// and anything keyed on a Unicode-folded name would treat them as one user.
+func foldUsername(username string) string {
+	b := []byte(username)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// sameUsername reports whether two names are the same row in the users table.
+func sameUsername(a, b string) bool {
+	return foldUsername(a) == foldUsername(b)
+}
+
 // sessionState is what a request needs to know about its session's user.
 type sessionState struct {
 	Username string
@@ -87,7 +106,7 @@ const (
 // sessionStateFor returns the user's current roles, active flag and session
 // epoch. fresh skips the cache (used when a session is created).
 func (s *UserStore) sessionStateFor(username string, fresh bool) (sessionState, bool, error) {
-	key := strings.ToLower(username)
+	key := foldUsername(username)
 	now := time.Now()
 
 	s.stateMu.Lock()
@@ -133,7 +152,7 @@ func (s *UserStore) sessionStateFor(username string, fresh bool) (sessionState, 
 
 func (s *UserStore) forgetSessionState(username string) {
 	s.stateMu.Lock()
-	delete(s.state, strings.ToLower(username))
+	delete(s.state, foldUsername(username))
 	s.stateMu.Unlock()
 }
 
@@ -177,11 +196,14 @@ func (s *UserStore) Create(username, password string, roles []string) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().Unix()
+	now := time.Now()
+	// The session epoch starts at a value no earlier account of this name
+	// had: a session left over from a deleted user must not fit the user
+	// created under the same name later.
 	_, err = s.db.Exec(
-		`INSERT INTO users (username, password_hash, roles, active, created_at, updated_at)
-		 VALUES (?, ?, ?, 1, ?, ?)`,
-		username, hash, string(rolesJSON), now, now,
+		`INSERT INTO users (username, password_hash, roles, active, session_epoch, created_at, updated_at)
+		 VALUES (?, ?, ?, 1, ?, ?, ?)`,
+		username, hash, string(rolesJSON), now.UnixNano(), now.Unix(), now.Unix(),
 	)
 	if err != nil {
 		if isUniqueConstraint(err) {
@@ -189,6 +211,7 @@ func (s *UserStore) Create(username, password string, roles []string) error {
 		}
 		return fmt.Errorf("goauth: create user: %w", err)
 	}
+	s.forgetSessionState(username)
 	return nil
 }
 

@@ -179,6 +179,11 @@ func TestSessionWithoutEpochStaysValidUntilRevoked(t *testing.T) {
 	m := newTestMFAManager(t)
 	defer m.Close()
 	mustCreate(t, m, "alice", testPassword)
+	// A row from before the column existed gets the column default.
+	if _, err := m.db.Exec(`UPDATE users SET session_epoch=0`); err != nil {
+		t.Fatal(err)
+	}
+	m.Users.forgetSessionState("alice")
 	c := newTestClient(t, m)
 	c.do(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.session.Put(r.Context(), sessionUsernameKey, "alice")
@@ -333,7 +338,7 @@ func totpCode(t *testing.T, secret string, at time.Time) string {
 func enrollTOTP(t *testing.T, c *testClient) string {
 	t.Helper()
 	m := c.m
-	rec := c.do(m.Require()(m.selfTOTPEnrollStartHandler()), http.MethodPost, RouteMeSecurityTOTPEnrollStart, map[string]string{})
+	rec := c.do(m.Require()(m.selfTOTPEnrollStartHandler()), http.MethodPost, RouteMeSecurityTOTPEnrollStart, map[string]string{"password": testPassword})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enroll start = %d %s", rec.Code, rec.Body.String())
 	}
@@ -506,5 +511,201 @@ func TestPasskeyLoginBeginDoesNotRevealAccounts(t *testing.T) {
 		if i > 0 && bodies[i] != bodies[0] {
 			t.Fatalf("answer for %q differs from the one for %q:\n%s\n%s", name, "alice", bodies[i], bodies[0])
 		}
+	}
+}
+
+// ── Findings of the review of this change ────────────────────────────────────
+
+// seedPendingMFA puts a password-verified, not yet MFA-verified login for
+// username into the client's session, as LoginHandler does.
+func seedPendingMFA(c *testClient, username string, deadline time.Time) {
+	c.t.Helper()
+	m := c.m
+	c.do(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, _, err := m.Users.sessionStateFor(username, true)
+		if err != nil {
+			c.t.Fatalf("session state: %v", err)
+		}
+		m.session.Put(r.Context(), sessionMFAPendingUserKey, username)
+		m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, deadline.Format(time.RFC3339Nano))
+		m.session.Put(r.Context(), sessionMFAPendingEpochKey, st.Epoch)
+	}), http.MethodGet, "/seed", nil)
+}
+
+// SQLite compares usernames ASCII-case-insensitively. "\u212Aate" (Kelvin
+// sign) is a different user from "kate", and must stay one everywhere.
+func TestUnicodeLookalikeUsernamesAreDifferentUsers(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	const admin, lookalike = "kate", "\u212Aate"
+	mustCreate(t, m, admin, testPassword, "admin")
+	mustCreate(t, m, lookalike, "the lookalike's password")
+
+	attacker := newTestClient(t, m)
+	if rec := attacker.login(lookalike, "the lookalike's password"); rec.Code != http.StatusOK {
+		t.Fatalf("lookalike login = %d %s", rec.Code, rec.Body.String())
+	}
+	real := newTestClient(t, m)
+	real.login(admin, testPassword)
+	// In both orders: whichever of the two was looked up last must not
+	// answer for the other.
+	for i := 0; i < 2; i++ {
+		m.Users.forgetSessionState(admin)
+		m.Users.forgetSessionState(lookalike)
+		first, second := real, attacker
+		if i == 1 {
+			first, second = attacker, real
+		}
+		first.authed()
+		second.authed()
+		if ok, _ := real.authed("admin"); !ok {
+			t.Fatalf("order %d: the real admin was refused", i)
+		}
+		if ok, roles := attacker.authed("admin"); ok {
+			t.Fatalf("order %d: lookalike user passed Require(admin) with roles %v", i, roles)
+		}
+		if ok, _ := attacker.authed(); !ok {
+			t.Fatalf("order %d: the lookalike user lost their own session", i)
+		}
+	}
+	if sameUsername(admin, lookalike) || !sameUsername("Kate", "kATE") {
+		t.Fatal("sameUsername must fold ASCII case only")
+	}
+}
+
+func TestSessionOfADeletedUserDoesNotFitItsNamesake(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	mustCreate(t, m, "bob", testPassword)
+	c := newTestClient(t, m)
+	c.login("bob", testPassword)
+	if err := m.Users.Delete("bob"); err != nil {
+		t.Fatal(err)
+	}
+	mustCreate(t, m, "bob", "somebody else entirely", "admin")
+	if ok, roles := c.authed(); ok {
+		t.Fatalf("the deleted user's session works for the new user (roles %v)", roles)
+	}
+}
+
+// With a session alone, nothing may add a factor or produce an MFA proof.
+func TestSessionAloneCannotEnrollOrEarnAnMFAProof(t *testing.T) {
+	m := newTestWebAuthnManager(t)
+	defer m.Close()
+	mustCreate(t, m, "alice", testPassword)
+	c := newTestClient(t, m)
+	c.login("alice", testPassword)
+
+	for name, h := range map[string]http.Handler{
+		"totp enroll start":   m.Require()(m.selfTOTPEnrollStartHandler()),
+		"passkey register":    m.Require()(m.selfWebAuthnRegistrationBeginHandler()),
+		"recovery regenerate": m.Require()(m.selfMFARecoveryRegenerateHandler()),
+		"mfa disable":         m.Require()(m.selfMFADisableHandler()),
+	} {
+		if rec := c.do(h, http.MethodPost, "/x", map[string]string{}); rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s with a session alone = %d, want 401", name, rec.Code)
+		}
+	}
+	if u, _ := m.Users.GetByUsername("alice"); u.MFAEnabled {
+		t.Fatal("MFA got enabled without re-authentication")
+	}
+}
+
+// An admin working on someone else's account proves nothing about their own.
+func TestAdminActingOnAnotherUserEarnsNoMFAProof(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	mustCreate(t, m, "root", testPassword, "admin")
+	mustCreate(t, m, "bob", testPassword)
+	c := newTestClient(t, m)
+	c.login("root", testPassword)
+
+	mux := http.NewServeMux()
+	m.RegisterAdminSecurityRoutes(mux)
+	if rec := c.do(mux, http.MethodPost, "/admin/users/bob/security/recovery-codes/regenerate", map[string]string{}); rec.Code != http.StatusOK {
+		t.Fatalf("admin regenerate for bob = %d %s", rec.Code, rec.Body.String())
+	}
+	rec := c.do(mux, http.MethodPost, "/admin/users/bob/security/mfa/totp/enroll/start", map[string]string{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin enroll start for bob = %d %s", rec.Code, rec.Body.String())
+	}
+	code := totpCode(t, otpSecret(t, rec.Body.Bytes()), time.Now())
+	if rec := c.do(mux, http.MethodPost, "/admin/users/bob/security/mfa/totp/enroll/confirm", map[string]string{"code": code}); rec.Code != http.StatusOK {
+		t.Fatalf("admin enroll confirm for bob = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := c.do(m.Require()(m.selfMFADisableHandler()), http.MethodPost, "/me/security/mfa/disable", map[string]string{}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("admin's own MFA disable after working on bob = %d, want 401", rec.Code)
+	}
+}
+
+func TestTOTPEnrollConfirmGuessesAreLimited(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	mustCreate(t, m, "alice", testPassword)
+	c := newTestClient(t, m)
+	c.login("alice", testPassword)
+	if rec := c.do(m.Require()(m.selfTOTPEnrollStartHandler()), http.MethodPost, "/start", map[string]string{"password": testPassword}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll start = %d", rec.Code)
+	}
+	confirm := m.Require()(m.selfTOTPEnrollConfirmHandler())
+	var last int
+	for i := 0; i < m.mfaRL.maxPerUser+1; i++ {
+		last = c.do(confirm, http.MethodPost, "/confirm", map[string]string{"code": "000000"}).Code
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("confirm guess past the limit = %d, want 429", last)
+	}
+}
+
+// A password reset between the password step and the code ends that login.
+func TestHalfFinishedMFALoginEndsWithRevocation(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	mustCreate(t, m, "alice", testPassword)
+	c := newTestClient(t, m)
+	c.login("alice", testPassword)
+	secret := enrollTOTP(t, c)
+
+	half := newTestClient(t, m)
+	half.login("alice", testPassword)
+	if err := m.Users.SetPassword("alice", "reset by an admin meanwhile"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := mfaVerify(half, totpCode(t, secret, time.Now())); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("MFA verify after a password reset = %d, want 401", rec.Code)
+	}
+	if ok, _ := half.authed(); ok {
+		t.Fatal("login completed with a password that had been reset")
+	}
+}
+
+func TestWrongTOTPWithoutMethodIsNotReportedAsExhaustedRecoveryCodes(t *testing.T) {
+	m := newTestMFAManager(t)
+	defer m.Close()
+	mustCreate(t, m, "alice", testPassword)
+	c := newTestClient(t, m)
+	c.login("alice", testPassword)
+	enrollTOTP(t, c) // no recovery codes were ever generated
+
+	u := newTestClient(t, m)
+	u.login("alice", testPassword)
+	rec := u.do(m.LoginMFAVerifyHandler(), http.MethodPost, "/login/mfa/verify", map[string]string{"code": "000000"})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong code, no method = %d %s, want 401", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPasskeyLoginBeginWritesNothingForARefusedAccount(t *testing.T) {
+	m := newTestWebAuthnManager(t)
+	defer m.Close()
+	mustCreate(t, m, "alice", testPassword)
+	var before int64
+	m.db.QueryRow(`SELECT updated_at + COALESCE(LENGTH(webauthn_user_handle),0) FROM users`).Scan(&before)
+	newTestClient(t, m).do(m.WebAuthnLoginBeginHandler(), http.MethodPost, "/login/webauthn/begin", map[string]string{"username": "alice"})
+	var after, challenges int64
+	m.db.QueryRow(`SELECT updated_at + COALESCE(LENGTH(webauthn_user_handle),0) FROM users`).Scan(&after)
+	m.db.QueryRow(`SELECT COUNT(*) FROM webauthn_challenges`).Scan(&challenges)
+	if before != after || challenges != 0 {
+		t.Fatalf("a refused begin changed the account (user row %d -> %d, challenges %d)", before, after, challenges)
 	}
 }

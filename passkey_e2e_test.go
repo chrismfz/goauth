@@ -263,3 +263,30 @@ func TestPasskeyLoginRejectsAForgedAssertion(t *testing.T) {
 		t.Fatal("forged assertion produced a session")
 	}
 }
+
+// The passkey must not finish a password login that has since expired, even
+// when something else already cleared it from the session.
+func TestPasskeyFinishRejectsAnExpiredPasswordLogin(t *testing.T) {
+	m, a := setupPasskeyUser(t, 0x01|0x04)
+	defer m.Close()
+	c := newTestClient(t, m)
+	c.login("alice", testPassword)
+	begin := c.do(m.WebAuthnLoginBeginHandler(), http.MethodPost, "/login/webauthn/begin", nil)
+	if begin.Code != http.StatusOK {
+		t.Fatalf("begin = %d %s", begin.Code, begin.Body.String())
+	}
+	// The deadline passes, and the TOTP endpoint is the one that notices.
+	c.do(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, "2000-01-01T00:00:00Z")
+	}), http.MethodGet, "/expire", nil)
+	if rec := mfaVerify(c, "000000"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("verify after the deadline = %d, want 401", rec.Code)
+	}
+	rec := c.do(m.WebAuthnLoginFinishHandler(), http.MethodPost, "/login/webauthn/finish", a.assertion(begin.Body.Bytes()))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("passkey finish after the password login expired = %d %s, want 401", rec.Code, rec.Body.String())
+	}
+	if ok, _ := c.authed(); ok {
+		t.Fatal("expired login was completed by the passkey")
+	}
+}

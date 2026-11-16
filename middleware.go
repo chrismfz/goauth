@@ -21,6 +21,7 @@ const (
 	sessionEpochKey                   = "goauth.epoch"
 	sessionMFAPendingUserKey          = "goauth.mfa_pending_user"
 	sessionMFAPendingDeadlineKey      = "goauth.mfa_deadline"
+	sessionMFAPendingEpochKey         = "goauth.mfa_pending_epoch"
 	sessionMFAVerifiedAtKey           = "goauth.mfa_verified_at"
 	sessionWebAuthnRegChallengeIDKey  = "goauth.webauthn_registration_challenge_id"
 	sessionWebAuthnAuthChallengeIDKey = "goauth.webauthn_auth_challenge_id"

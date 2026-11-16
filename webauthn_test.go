@@ -49,6 +49,11 @@ func TestWebAuthnLoginFinishRejectsMismatchedPendingMFAUser(t *testing.T) {
 		m.session.Put(r.Context(), sessionWebAuthnLoginModeKey, string(webauthnLoginModePasswordless))
 		m.session.Put(r.Context(), sessionMFAPendingUserKey, pendingUser)
 		m.session.Put(r.Context(), sessionMFAPendingDeadlineKey, time.Now().Add(5*time.Minute).Format(time.RFC3339Nano))
+		st, _, err := m.Users.sessionStateFor(pendingUser, true)
+		if err != nil {
+			t.Errorf("session state: %v", err)
+		}
+		m.session.Put(r.Context(), sessionMFAPendingEpochKey, st.Epoch)
 		w.WriteHeader(http.StatusNoContent)
 	})
 	seedReq := httptest.NewRequest(http.MethodGet, "/seed", nil)
