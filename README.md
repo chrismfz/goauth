@@ -185,7 +185,7 @@ This section documents a practical split between **self-service user flows** and
 |---|---|---|---|---|
 | `/login` | `POST` | No | Self | `200` success session, or `200` `{ "mfa_required": true }`, `401` invalid credentials, `429` rate limited |
 | `/login/mfa/verify` | `POST` | Pending login challenge | Self | `200` session established, `400` bad payload/method, `401` invalid MFA proof |
-| `/me/security/mfa/totp/enroll/start` | `POST` | Session | Self | `200` enrollment payload (`issuer`, `account`, `otpauth_uri`), `401` unauthenticated |
+| `/me/security/mfa/totp/enroll/start` | `POST` | Session; if MFA is already on, also `{"password": "..."}` or a recent MFA proof | Self | `200` enrollment payload (`issuer`, `account`, `otpauth_uri`), `401` unauthenticated or re-authentication required, `429` rate limited |
 | `/me/security/mfa/totp/enroll/confirm` | `POST` | Session | Self | `200` MFA enabled + recovery codes, `400` invalid code, `401` unauthenticated |
 | `/me/security/recovery-codes/regenerate` | `POST` | Session + successful MFA step-up (recommended) | Self | `200` new recovery codes (shown once), `401` unauthenticated, `403` policy blocked |
 | `/me` | `GET` | Session | Self | `200` current user profile, `401` unauthenticated |
@@ -193,6 +193,18 @@ This section documents a practical split between **self-service user flows** and
 | `/admin/users/{username}/mfa/recovery/regenerate` | `POST` | Admin session/token | Admin | `200` new recovery codes for out-of-band delivery, `403` non-admin, `404` user not found |
 | `myapp auth mfa reset --user <name>` | CLI | Local operator access + admin controls | CLI admin | Exit `0` success, non-zero on validation or storage error |
 | `myapp auth mfa recovery-regenerate --user <name>` | CLI | Local operator access + admin controls | CLI admin | Exit `0` success (prints one-time codes once), non-zero on error |
+
+**Re-authentication.** Changing your own sign-in factors takes more than a
+session: the body carries `{"password": "..."}`, unless the session proved a
+second factor in the last 10 minutes. This applies to `mfa/disable`,
+`recovery-codes/regenerate`, `passkeys/register/start`, and to
+`mfa/totp/enroll/start` when MFA is already enabled (a first enrollment needs
+only the session). Without it the answer is `401` with
+`re-authentication required (password or recent MFA proof)`.
+
+**Enrollment does not interrupt MFA.** `enroll/start` stores the new secret as
+pending. The current authenticator keeps working until `enroll/confirm`
+accepts a code from the new one, and only then does the new secret take over.
 
 #### Role matrix
 
@@ -334,25 +346,30 @@ never reached for proxied browser requests.
 
 ### Solution: realIP + realIPAllowed
 
-Trust `X-Forwarded-For` **only when the direct connection is from loopback**.
-External clients cannot inject XFF when they connect directly — only a
-trusted local proxy (nginx) can set it.
+Trust `X-Forwarded-For` **only when the direct connection is from loopback**,
+and then **only its last entry**: that is the one your proxy wrote. Everything
+to its left came from the client.
+
+> **Security note.** An earlier version of this example read the *first*
+> entry. With a proxy that appends (`$proxy_add_x_forwarded_for`), the first
+> entry is client-supplied: `X-Forwarded-For: 127.0.0.1` made any request
+> loopback, and `realIPAllowed` then let it in without a token or a session.
+> If you copied that version, change it and your proxy config (below).
 
 ```go
 // realIP returns the true client IP.
-// When the direct connection is from loopback (nginx proxying), reads
-// X-Forwarded-For to get the actual client address.
-// XFF is only trusted from loopback — external clients cannot spoof it.
+// When the direct connection is from loopback (nginx proxying), reads the
+// LAST X-Forwarded-For entry: the address the proxy itself saw.
 func realIP(r *http.Request) net.IP {
     host, _, _ := net.SplitHostPort(r.RemoteAddr)
     directIP := net.ParseIP(host)
 
     if directIP != nil && directIP.IsLoopback() {
-        if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-            first := strings.TrimSpace(strings.Split(fwd, ",")[0])
-            if ip := net.ParseIP(first); ip != nil {
-                return ip
-            }
+        if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+            parts := strings.Split(values[len(values)-1], ",")
+            // A proxy sent the header: the request is not from this machine.
+            // An unreadable entry is nobody, never loopback.
+            return net.ParseIP(strings.TrimSpace(parts[len(parts)-1]))
         }
         // Loopback with no XFF = local tool (CLI, curl on server) → still loopback
         return directIP
@@ -534,8 +551,10 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 
 ### nginx configuration
 
-nginx must forward the real client IP via `X-Forwarded-For`. Remove
-`auth_basic` entirely — goauth handles authentication.
+nginx must forward the real client IP via `X-Forwarded-For`, and must
+**overwrite** the header (`$remote_addr`), not append to what the client sent
+(`$proxy_add_x_forwarded_for`). Remove `auth_basic` entirely — goauth handles
+authentication.
 
 ```nginx
 server {
@@ -546,7 +565,7 @@ server {
         proxy_pass            http://127.0.0.1:9600;
         proxy_set_header      Host            $host;
         proxy_set_header      X-Real-IP       $remote_addr;
-        proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header      X-Forwarded-For $remote_addr;
     }
 
     # SSE streams — buffering must be off, XFF still required
@@ -555,7 +574,7 @@ server {
         proxy_buffering    off;
         proxy_cache        off;
         proxy_read_timeout 3600s;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-For $remote_addr;
     }
 }
 ```
@@ -950,34 +969,52 @@ alongside your service binary.
 
 ## Rate limiting
 
-`LoginHandler()` enforces two independent sliding-window rate limits
-out of the box — no configuration required:
+Three independent sliding-window limiters, no configuration required:
 
-| Limit | Default | Scope |
-|---|---|---|
-| Per IP | 10 attempts / 60s | blocks credential stuffing from a single source |
-| Per username | 20 attempts / 10min | blocks distributed attacks against one account |
+| What | Per IP | Per username | Notes |
+|---|---|---|---|
+| Password login (`LoginHandler`, passkey login begin) | 10 / 60s | 20 / 10min | |
+| MFA code (`LoginMFAVerifyHandler`) | 10 / 60s | 5 / 15min | cleared when the user gets in |
+| Password re-check inside a session (change password, disable MFA, ...) | 10 / 60s | 10 / 10min | cleared on a correct password |
 
 When a limit is breached the handler returns `429 Too Many Requests`
 with a `Retry-After` header and writes a `RATELIMIT` entry to `auth_log`.
 The in-memory counters are pruned automatically every 5 minutes.
 
-To tune the thresholds, edit `ratelimit.go`:
+Usernames are counted case-insensitively, as the database matches them. The
+per-username login limit means anyone can make a known username wait by
+failing 20 logins for it; that is the price of limiting distributed guessing.
 
-```go
-func newLoginRateLimiter() *loginRateLimiter {
-    return &loginRateLimiter{
-        windowIP:   time.Minute,
-        windowUser: 10 * time.Minute,
-        maxPerIP:   10,  // attempts per window per IP
-        maxPerUser: 20,  // attempts per window per username
-    }
-}
-```
+A TOTP code is accepted **once**: a second login needs the next code.
 
-The client IP is resolved through `X-Forwarded-For` when the connection
-comes from loopback (nginx proxy), so the real browser IP is always used
-for rate limiting — not `127.0.0.1`.
+The thresholds are set where the limiters are built, in `New()`
+(`goauth.go`) and `newLoginRateLimiter()` (`ratelimit.go`).
+
+The client IP is the direct peer, or, when that peer is loopback (a local
+reverse proxy), the **last** `X-Forwarded-For` entry. Request bodies are
+capped at 64 KiB, usernames at 255 bytes and passwords at 1024.
+
+---
+
+## Sessions and revocation
+
+A session is checked against the user table on every request (`Require` and
+`IsAuthenticated`), through a cache of a few seconds:
+
+- the account must still exist and be active;
+- the session must predate no revocation: `SetPassword`, `SetActive(false)`,
+  `Delete` and `RevokeSessions(username)` end every session of the user;
+- roles are read from the database, so `SetRoles` applies to open sessions.
+
+A change made by another process (the CLI) reaches a running server within
+about 5 seconds. A user changing their own password through the
+password-change handler keeps the session they did it from; if your
+application calls `Users.SetPassword` directly, that user is logged out
+everywhere, including where they did it.
+
+Session tokens are stored as SHA-256. `ListSessions()` returns those hashes:
+they identify a row and cannot be used as a cookie. Rows written by an older
+version are converted when the database is opened.
 
 ---
 
@@ -1133,12 +1170,13 @@ func authCmdLogPurge(dbPath *string) *cobra.Command {
 |---|---|---|
 | `DBPath` | — | Path to SQLite file (created if absent) |
 | `SessionTTL` | `8h` | Absolute session lifetime |
-| `IdleTimeout` | `30m` | Inactivity expiry (0 = disabled) |
+| `IdleTimeout` | `0` (disabled) | Inactivity expiry. When set, every request writes the session |
 | `CookieName` | `__Host-sid` | Cookie name (`__Host-` forces Secure + Path=/) |
 | `SecureCookie` | `false` | Set `Secure` flag (required in production over HTTPS) |
 | `SameSite` | `Strict` | `SameSite` cookie attribute |
 | `LoginPath` | `/login` | Redirect target for unauthenticated browser requests |
 | `OnAuthFailure` | `nil` | Custom handler called on 401/403 (overrides default behaviour) |
+| `MinPasswordLength` | `12` | Shortest new password the password-change handlers accept (not applied to `Users.Create` / `Users.SetPassword`) |
 
 **Cookie name note:** `__Host-` prefix enforces `Secure=true`, `Path=/`, and
 no `Domain` at the browser level. Requires `SecureCookie: true`. Use a plain
@@ -1162,7 +1200,7 @@ CREATE TABLE users (
 );
 
 CREATE TABLE sessions (
-    token  TEXT    PRIMARY KEY,
+    token  TEXT    PRIMARY KEY,  -- SHA-256 of the session token
     data   BLOB    NOT NULL,
     expiry INTEGER NOT NULL
 );
@@ -1189,7 +1227,8 @@ CREATE TABLE auth_log (
 - [ ] `auth.db_path` configured
 - [ ] `secure_cookie: true` in production (HTTPS)
 - [ ] Cookie name: plain name for HTTP, `__Host-` prefix for HTTPS
-- [ ] nginx: `auth_basic` removed, `X-Forwarded-For` header forwarded
+- [ ] nginx: `auth_basic` removed, `X-Forwarded-For` **overwritten** with `$remote_addr` (never `$proxy_add_x_forwarded_for`)
+- [ ] `realIP` reads the LAST `X-Forwarded-For` entry
 - [ ] First user created: `myapp auth user add -u admin -r admin`
 - [ ] `WithAuth` uses `realIPAllowed` not `r.RemoteAddr` / `ipAllowed`
 - [ ] `WithMainIPOnly` uses `realIPAllowed` not `r.RemoteAddr` / `ipAllowed`
