@@ -3,6 +3,7 @@ package goauth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base32"
 	"encoding/hex"
@@ -16,6 +17,10 @@ import (
 	"github.com/alexedwards/argon2id"
 	"github.com/pquerna/otp/totp"
 )
+
+// totpPeriod is the TOTP time step in seconds (the RFC 6238 default, which is
+// what totp.Generate and every authenticator app use).
+const totpPeriod = 30
 
 // Sentinel errors returned by UserStore operations.
 var (
@@ -51,6 +56,99 @@ func (u *User) HasRole(role string) bool {
 // UserStore provides user management backed by SQLite.
 type UserStore struct {
 	db *sql.DB
+
+	stateMu sync.Mutex
+	state   map[string]cachedSessionState
+}
+
+// sessionState is what a request needs to know about its session's user.
+type sessionState struct {
+	Username string
+	Roles    []string
+	Active   bool
+	Epoch    int64
+}
+
+type cachedSessionState struct {
+	st    sessionState
+	found bool
+	at    time.Time
+}
+
+const (
+	// A change made by another process (the CLI) reaches a running server
+	// within this long. Changes made in-process drop the entry at once.
+	sessionStateTTL = 5 * time.Second
+	// When the database cannot be read, the last answer is used for this
+	// long, so a busy database does not bounce every logged-in user.
+	sessionStateStaleTTL = time.Minute
+)
+
+// sessionStateFor returns the user's current roles, active flag and session
+// epoch. fresh skips the cache (used when a session is created).
+func (s *UserStore) sessionStateFor(username string, fresh bool) (sessionState, bool, error) {
+	key := strings.ToLower(username)
+	now := time.Now()
+
+	s.stateMu.Lock()
+	cached, have := s.state[key]
+	s.stateMu.Unlock()
+	if have && !fresh && now.Sub(cached.at) < sessionStateTTL {
+		return cached.st, cached.found, nil
+	}
+
+	var (
+		st     sessionState
+		roles  string
+		active int
+	)
+	err := s.db.QueryRow(
+		`SELECT username, roles, active, session_epoch FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&st.Username, &roles, &active, &st.Epoch)
+	found := true
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		found = false
+	case err != nil:
+		if have && !fresh && now.Sub(cached.at) < sessionStateStaleTTL {
+			return cached.st, cached.found, nil
+		}
+		return sessionState{}, false, fmt.Errorf("goauth: session state: %w", err)
+	default:
+		if json.Unmarshal([]byte(roles), &st.Roles) != nil {
+			st.Roles = []string{}
+		}
+		st.Active = active == 1
+	}
+
+	s.stateMu.Lock()
+	if s.state == nil {
+		s.state = make(map[string]cachedSessionState)
+	}
+	s.state[key] = cachedSessionState{st: st, found: found, at: now}
+	s.stateMu.Unlock()
+	return st, found, nil
+}
+
+func (s *UserStore) forgetSessionState(username string) {
+	s.stateMu.Lock()
+	delete(s.state, strings.ToLower(username))
+	s.stateMu.Unlock()
+}
+
+// RevokeSessions ends every session of the user ("log out everywhere"). A
+// running server notices within a few seconds when another process calls it.
+func (s *UserStore) RevokeSessions(username string) error {
+	res, err := s.db.Exec(
+		`UPDATE users SET session_epoch=session_epoch+1, updated_at=? WHERE username=? COLLATE NOCASE`,
+		time.Now().Unix(), username,
+	)
+	if err != nil {
+		return fmt.Errorf("goauth: revoke sessions: %w", err)
+	}
+	s.forgetSessionState(username)
+	return requireOneRow(res, ErrUserNotFound)
 }
 
 const DefaultRecoveryCodeCount = 10
@@ -94,39 +192,45 @@ func (s *UserStore) Create(username, password string, roles []string) error {
 	return nil
 }
 
-// SetPassword replaces the stored password hash for the given username.
+// SetPassword replaces the stored password hash for the given username and
+// ends every session of the user: whoever held the old password, or a session
+// made with it, is out.
 func (s *UserStore) SetPassword(username, newPassword string) error {
 	hash, err := argon2id.CreateHash(newPassword, argon2id.DefaultParams)
 	if err != nil {
 		return fmt.Errorf("goauth: hash password: %w", err)
 	}
 	res, err := s.db.Exec(
-		`UPDATE users SET password_hash=?, updated_at=? WHERE username=? COLLATE NOCASE`,
+		`UPDATE users SET password_hash=?, session_epoch=session_epoch+1, updated_at=? WHERE username=? COLLATE NOCASE`,
 		hash, time.Now().Unix(), username,
 	)
 	if err != nil {
 		return fmt.Errorf("goauth: set password: %w", err)
 	}
+	s.forgetSessionState(username)
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// SetActive enables or disables a user account.
+// SetActive enables or disables a user account. Disabling ends the user's
+// sessions, and enabling the account again does not bring them back.
 func (s *UserStore) SetActive(username string, active bool) error {
-	val := 0
+	val, bump := 0, 1
 	if active {
-		val = 1
+		val, bump = 1, 0
 	}
 	res, err := s.db.Exec(
-		`UPDATE users SET active=?, updated_at=? WHERE username=? COLLATE NOCASE`,
-		val, time.Now().Unix(), username,
+		`UPDATE users SET active=?, session_epoch=session_epoch+?, updated_at=? WHERE username=? COLLATE NOCASE`,
+		val, bump, time.Now().Unix(), username,
 	)
 	if err != nil {
 		return fmt.Errorf("goauth: set active: %w", err)
 	}
+	s.forgetSessionState(username)
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// SetRoles replaces the role list for the given user.
+// SetRoles replaces the role list for the given user. Open sessions get the
+// new roles on their next request.
 func (s *UserStore) SetRoles(username string, roles []string) error {
 	if roles == nil {
 		roles = []string{}
@@ -142,6 +246,7 @@ func (s *UserStore) SetRoles(username string, roles []string) error {
 	if err != nil {
 		return fmt.Errorf("goauth: set roles: %w", err)
 	}
+	s.forgetSessionState(username)
 	return requireOneRow(res, ErrUserNotFound)
 }
 
@@ -151,6 +256,7 @@ func (s *UserStore) Delete(username string) error {
 	if err != nil {
 		return fmt.Errorf("goauth: delete user: %w", err)
 	}
+	s.forgetSessionState(username)
 	return requireOneRow(res, ErrUserNotFound)
 }
 
@@ -183,8 +289,13 @@ func (s *UserStore) ConfirmTOTP(username string) error {
 	return requireOneRow(res, ErrUserNotFound)
 }
 
-// BeginTOTPEnrollment generates and stores a pending TOTP secret for a user.
-// The returned enrollment payload includes the otpauth URI for QR generation.
+// BeginTOTPEnrollment generates a TOTP secret for a user and stores it as
+// PENDING. The returned enrollment payload includes the otpauth URI for QR
+// generation.
+//
+// Nothing about the user's current MFA changes until the new secret is
+// confirmed with a code. It used to overwrite the active secret and switch
+// MFA off on the spot, so starting an enrollment was a way to disable MFA.
 func (s *UserStore) BeginTOTPEnrollment(username, issuer string, mfaKey []byte) (*TOTPEnrollment, error) {
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      issuer,
@@ -198,7 +309,14 @@ func (s *UserStore) BeginTOTPEnrollment(username, issuer string, mfaKey []byte) 
 	if err != nil {
 		return nil, fmt.Errorf("goauth: begin totp enrollment: %w", err)
 	}
-	if err := s.SetTOTPSecretUnverified(username, enc); err != nil {
+	res, err := s.db.Exec(
+		`UPDATE users SET totp_pending_secret_enc=?, updated_at=? WHERE username=? COLLATE NOCASE`,
+		enc, time.Now().Unix(), username,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("goauth: begin totp enrollment: %w", err)
+	}
+	if err := requireOneRow(res, ErrUserNotFound); err != nil {
 		return nil, err
 	}
 
@@ -210,15 +328,65 @@ func (s *UserStore) BeginTOTPEnrollment(username, issuer string, mfaKey []byte) 
 	}, nil
 }
 
-// VerifyTOTPEnrollment validates a TOTP code against a pending secret and
-// enables TOTP MFA on success.
-func (s *UserStore) VerifyTOTPEnrollment(username, code string, mfaKey []byte) (verified bool, pending bool, err error) {
-	enc, err := s.GetTOTPSecret(username)
-	if err != nil {
-		return false, false, err
+// matchTOTPStep reports which time step (now, one before or one after) the
+// code belongs to. It accepts what totp.Validate accepts, and also says which
+// step matched, so that a step can be refused the second time.
+func matchTOTPStep(code, secret string, now time.Time) (int64, bool) {
+	code = normalizeMFACode(code)
+	current := now.Unix() / totpPeriod
+	for _, step := range []int64{current, current - 1, current + 1} {
+		want, err := totp.GenerateCode(secret, time.Unix(step*totpPeriod, 0))
+		if err != nil {
+			return 0, false
+		}
+		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
+			return step, true
+		}
 	}
+	return 0, false
+}
+
+// consumeTOTPStep records a matched time step and reports whether it was new.
+// A code seen over a shoulder or on the wire cannot be used again, not even
+// inside its own 90-second window.
+func (s *UserStore) consumeTOTPStep(username string, step int64) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE users SET totp_last_step=? WHERE username=? COLLATE NOCASE AND totp_last_step < ?`,
+		step, username, step,
+	)
+	if err != nil {
+		return false, fmt.Errorf("goauth: consume totp step: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// VerifyTOTPEnrollment validates a TOTP code against a pending secret and
+// enables TOTP MFA on success: the pending secret becomes the active one.
+func (s *UserStore) VerifyTOTPEnrollment(username, code string, mfaKey []byte) (verified bool, pending bool, err error) {
+	var (
+		pendingEnc, activeEnc sql.NullString
+		enabled               int
+	)
+	err = s.db.QueryRow(
+		`SELECT totp_pending_secret_enc, totp_secret_enc, mfa_enabled FROM users WHERE username=? COLLATE NOCASE`,
+		username,
+	).Scan(&pendingEnc, &activeEnc, &enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, ErrUserNotFound
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("goauth: verify totp enrollment: %w", err)
+	}
+
+	enc := pendingEnc.String
 	if enc == "" {
-		return false, false, nil
+		// An enrollment started by an older version (or SetTOTPSecretUnverified)
+		// keeps its secret in the active column with MFA off.
+		if enabled == 1 || activeEnc.String == "" {
+			return false, false, nil
+		}
+		enc = activeEnc.String
 	}
 	pending = true
 
@@ -226,10 +394,22 @@ func (s *UserStore) VerifyTOTPEnrollment(username, code string, mfaKey []byte) (
 	if err != nil {
 		return false, pending, fmt.Errorf("goauth: verify totp enrollment: %w", err)
 	}
-	if !totp.Validate(normalizeMFACode(code), secret) {
+	step, ok := matchTOTPStep(code, secret, time.Now())
+	if !ok {
 		return false, pending, nil
 	}
-	if err := s.ConfirmTOTP(username); err != nil {
+	now := time.Now().Unix()
+	res, err := s.db.Exec(
+		`UPDATE users
+		 SET mfa_enabled=1, mfa_type='totp', totp_secret_enc=?, totp_pending_secret_enc=NULL,
+		     totp_verified_at=?, totp_last_step=?, updated_at=?
+		 WHERE username=? COLLATE NOCASE`,
+		enc, now, step, now, username,
+	)
+	if err != nil {
+		return false, pending, fmt.Errorf("goauth: verify totp enrollment: %w", err)
+	}
+	if err := requireOneRow(res, ErrUserNotFound); err != nil {
 		return false, pending, err
 	}
 	return true, pending, nil
@@ -239,7 +419,7 @@ func (s *UserStore) VerifyTOTPEnrollment(username, code string, mfaKey []byte) (
 func (s *UserStore) DisableMFA(username string) error {
 	res, err := s.db.Exec(
 		`UPDATE users
-		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
+		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_pending_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
 		 WHERE username=? COLLATE NOCASE`,
 		time.Now().Unix(), username,
 	)
@@ -270,7 +450,7 @@ func (s *UserStore) ResetMFA(username string) error {
 	now := time.Now().Unix()
 	if _, err := tx.Exec(
 		`UPDATE users
-		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
+		 SET mfa_enabled=0, mfa_type='', totp_secret_enc=NULL, totp_pending_secret_enc=NULL, totp_verified_at=NULL, updated_at=?
 		 WHERE id=?`,
 		now, userID,
 	); err != nil {

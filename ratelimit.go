@@ -24,16 +24,28 @@ type loginRateLimiter struct {
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
+	// 10 attempts / min per IP, 20 attempts / 10 min per username.
+	return newRateLimiter(time.Minute, 10, 10*time.Minute, 20)
+}
+
+func newRateLimiter(windowIP time.Duration, maxPerIP int, windowUser time.Duration, maxPerUser int) *loginRateLimiter {
 	rl := &loginRateLimiter{
 		byIP:       make(map[string][]time.Time),
 		byUser:     make(map[string][]time.Time),
-		windowIP:   time.Minute,
-		windowUser: 10 * time.Minute,
-		maxPerIP:   10, // 10 attempts / min per IP
-		maxPerUser: 20, // 20 attempts / 10 min per username
+		windowIP:   windowIP,
+		windowUser: windowUser,
+		maxPerIP:   maxPerIP,
+		maxPerUser: maxPerUser,
 	}
 	go rl.cleanup(5 * time.Minute)
 	return rl
+}
+
+// ResetUser forgets a username's attempts, after it authenticated.
+func (rl *loginRateLimiter) ResetUser(username string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	delete(rl.byUser, "u:"+strings.ToLower(strings.TrimSpace(username)))
 }
 
 // Allow returns (allowed, retryAfter).

@@ -1,7 +1,9 @@
 package goauth
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -20,12 +22,55 @@ func newSQLiteSessionStore(db *sql.DB) *sqliteSessionStore {
 	return s
 }
 
+// hashSessionToken is what the sessions table stores in place of the token.
+// The cookie holds the token; the table only its SHA-256, so reading the
+// database (a backup, a stray copy, the CLI's session list) no longer yields
+// usable sessions. The token is 256 random bits, so a plain hash is enough.
+func hashSessionToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// hashLegacySessionTokens rewrites rows written before tokens were hashed, so
+// an upgrade does not log everyone out. A hash is 64 hex characters and an scs
+// token 43, so the length tells them apart and a second run changes nothing.
+func hashLegacySessionTokens(db *sql.DB) error {
+	rows, err := db.Query(`SELECT token FROM sessions WHERE length(token) <> 64`)
+	if err != nil {
+		return err
+	}
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			rows.Close()
+			return err
+		}
+		tokens = append(tokens, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(tokens) == 0 {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, t := range tokens {
+		if _, err := tx.Exec(`UPDATE OR REPLACE sessions SET token=? WHERE token=?`, hashSessionToken(t), t); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // Find returns the session data for the given token, if it exists and has not expired.
 func (s *sqliteSessionStore) Find(token string) ([]byte, bool, error) {
 	var data []byte
 	var expiry int64
 	err := s.db.QueryRow(
-		`SELECT data, expiry FROM sessions WHERE token=?`, token,
+		`SELECT data, expiry FROM sessions WHERE token=?`, hashSessionToken(token),
 	).Scan(&data, &expiry)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -44,7 +89,7 @@ func (s *sqliteSessionStore) Commit(token string, data []byte, expiry time.Time)
 	_, err := s.db.Exec(
 		`INSERT INTO sessions (token, data, expiry) VALUES (?, ?, ?)
 		 ON CONFLICT(token) DO UPDATE SET data=excluded.data, expiry=excluded.expiry`,
-		token, data, expiry.Unix(),
+		hashSessionToken(token), data, expiry.Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("goauth/store: commit: %w", err)
@@ -54,22 +99,11 @@ func (s *sqliteSessionStore) Commit(token string, data []byte, expiry time.Time)
 
 // Delete removes a session record immediately (used on logout / token rotation).
 func (s *sqliteSessionStore) Delete(token string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, token)
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token=?`, hashSessionToken(token))
 	if err != nil {
 		return fmt.Errorf("goauth/store: delete: %w", err)
 	}
 	return nil
-}
-
-// DeleteByUsername removes all sessions belonging to a user.
-// Useful for "log out everywhere" or account deactivation.
-func (s *sqliteSessionStore) DeleteByUsername(username string) (int64, error) {
-	// Sessions store username in the scs-encoded blob, so we can't filter
-	// that column directly. We keep a username→token index for this purpose
-	// via a separate lookup — or we accept a full table scan on logout-all.
-	// For now this is a no-op placeholder; wire up if needed later.
-	_ = username
-	return 0, nil
 }
 
 // cleanup runs periodically and removes expired session rows.

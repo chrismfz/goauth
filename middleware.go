@@ -2,8 +2,9 @@ package goauth
 
 import (
 	"context"
-	"encoding/json"
+	"log"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -17,6 +18,7 @@ const (
 const (
 	sessionUsernameKey                = "goauth.username"
 	sessionRolesKey                   = "goauth.roles"
+	sessionEpochKey                   = "goauth.epoch"
 	sessionMFAPendingUserKey          = "goauth.mfa_pending_user"
 	sessionMFAPendingDeadlineKey      = "goauth.mfa_deadline"
 	sessionMFAVerifiedAtKey           = "goauth.mfa_verified_at"
@@ -30,6 +32,39 @@ const (
 func UserFromContext(ctx context.Context) (*User, bool) {
 	u, ok := ctx.Value(userContextKey).(*User)
 	return u, ok && u != nil
+}
+
+type sessionStatus int
+
+const (
+	sessionNone    sessionStatus = iota // no login in this session
+	sessionOK                           // logged in, user still entitled
+	sessionRevoked                      // user gone, disabled, or sessions revoked
+	sessionUnknown                      // the user database could not be read
+)
+
+// sessionUser resolves the session's user against the database: the account
+// must still exist and be active, and the session must have been created under
+// the user's current session epoch. Roles come from the database, not from the
+// session, so a role change applies at once.
+//
+// The session used to be trusted on its own for its whole lifetime: a disabled
+// or deleted user, or one whose password had been reset, kept every open
+// session, and a demoted admin stayed admin in them.
+func (m *Manager) sessionUser(r *http.Request) (*User, sessionStatus) {
+	username := m.session.GetString(r.Context(), sessionUsernameKey)
+	if username == "" {
+		return nil, sessionNone
+	}
+	st, found, err := m.Users.sessionStateFor(username, false)
+	if err != nil {
+		log.Printf("goauth: %v", err)
+		return nil, sessionUnknown
+	}
+	if !found || !st.Active || m.session.GetInt64(r.Context(), sessionEpochKey) != st.Epoch {
+		return nil, sessionRevoked
+	}
+	return &User{Username: st.Username, Roles: st.Roles, Active: true}, sessionOK
 }
 
 // Require returns a middleware that enforces authentication.
@@ -47,29 +82,23 @@ func UserFromContext(ctx context.Context) (*User, bool) {
 func (m *Manager) Require(roles ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			username := m.session.GetString(r.Context(), sessionUsernameKey)
-			if username == "" {
+			u, status := m.sessionUser(r)
+			if status != sessionOK {
+				if status == sessionRevoked {
+					_ = m.session.Destroy(r.Context())
+				}
 				m.denyUnauthenticated(w, r)
 				return
 			}
 
-			rolesJSON := m.session.GetString(r.Context(), sessionRolesKey)
-			var userRoles []string
-			json.Unmarshal([]byte(rolesJSON), &userRoles)
-
-			if len(roles) > 0 && !hasAnyRole(userRoles, roles) {
-				m.denyForbidden(w, r, username)
+			if len(roles) > 0 && !hasAnyRole(u.Roles, roles) {
+				m.denyForbidden(w, r, u.Username)
 				return
 			}
 
 			// Refresh idle timeout on every authenticated request.
-			m.session.Put(r.Context(), sessionUsernameKey, username)
+			m.session.Put(r.Context(), sessionUsernameKey, u.Username)
 
-			u := &User{
-				Username: username,
-				Roles:    userRoles,
-				Active:   true,
-			}
 			ctx := context.WithValue(r.Context(), userContextKey, u)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -93,7 +122,7 @@ func (m *Manager) denyUnauthenticated(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isBrowserRequest(r) {
-		http.Redirect(w, r, m.cfg.LoginPath+"?next="+r.URL.RequestURI(), http.StatusSeeOther)
+		http.Redirect(w, r, m.cfg.LoginPath+"?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -118,8 +147,12 @@ func (m *Manager) denyForbidden(w http.ResponseWriter, r *http.Request, username
 // IsAuthenticated reports whether the request carries a valid, active session.
 // Requires LoadAndSave to have already run (i.e. must be called from within
 // the handler chain, not before the mux).
+//
+// The user must also still exist, be active and not have had their sessions
+// revoked (see sessionUser).
 func (m *Manager) IsAuthenticated(r *http.Request) bool {
-	return m.session.GetString(r.Context(), sessionUsernameKey) != ""
+	_, status := m.sessionUser(r)
+	return status == sessionOK
 }
 
 // isBrowserRequest returns true when the client is likely a browser

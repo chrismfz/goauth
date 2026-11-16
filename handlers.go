@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/pquerna/otp/totp"
 )
 
 // loginRequest is the JSON body expected by LoginHandler.
@@ -91,6 +89,55 @@ func (m *Manager) resolveSelfSecuritySubjectOrWriteError(w http.ResponseWriter, 
 	return actor, actor.Username, true
 }
 
+// writeTooManyAttempts answers 429 with a Retry-After header.
+func writeTooManyAttempts(w http.ResponseWriter, retryAfter time.Duration, msg string) {
+	secs := int(retryAfter / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+	writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": msg})
+}
+
+// checkPassword verifies subject's password for an already logged-in caller
+// and writes the error response when it does not hold. These checks are rate
+// limited like a login: an open session must not be a place to guess the
+// password without limit.
+func (m *Manager) checkPassword(w http.ResponseWriter, r *http.Request, subject, password, wrongMsg string) bool {
+	if allowed, retryAfter := m.reauthRL.Allow(clientIP(r), subject); !allowed {
+		auditLog(m.db, LogEventRateLimit, subject, clientIP(r), "too_many_reauth_attempts")
+		writeTooManyAttempts(w, retryAfter, "too many attempts — please wait before trying again")
+		return false
+	}
+	if len(password) > maxPasswordLen {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": wrongMsg})
+		return false
+	}
+	if _, err := m.Users.Authenticate(subject, password); err != nil {
+		auditLog(m.db, LogEventFail, subject, clientIP(r), "reauth_bad_password")
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": wrongMsg})
+		return false
+	}
+	m.reauthRL.ResetUser(subject)
+	return true
+}
+
+// reauthenticate guards a change to the caller's own sign-in factors: it
+// passes on a recent MFA proof in this session, or else on the password.
+// An admin acting on another user is not asked (the admin role is the proof).
+func (m *Manager) reauthenticate(w http.ResponseWriter, r *http.Request, actor *User, subject, password string) bool {
+	if !strings.EqualFold(actor.Username, subject) || m.hasRecentMFAProof(r) {
+		return true
+	}
+	if password == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "re-authentication required (password or recent MFA proof)",
+		})
+		return false
+	}
+	return m.checkPassword(w, r, subject, password, "invalid password")
+}
+
 // SecurityPasswordChangeHandler changes the authenticated user's password.
 // A different subject can only be targeted by callers with admin role.
 func (m *Manager) SecurityPasswordChangeHandler() http.HandlerFunc {
@@ -119,11 +166,24 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 			return
 		}
 
-		requireCurrentPassword := strings.EqualFold(actor.Username, subject) || !hasAnyRole(actor.Roles, []string{"admin"})
-		req.CurrentPassword = strings.TrimSpace(req.CurrentPassword)
-		req.NewPassword = strings.TrimSpace(req.NewPassword)
+		// Passwords are taken as typed. They used to be trimmed here but not
+		// at login, so one set with a leading or trailing space never worked.
+		self := strings.EqualFold(actor.Username, subject)
+		requireCurrentPassword := self || !hasAnyRole(actor.Roles, []string{"admin"})
 		if req.NewPassword == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_password is required"})
+			return
+		}
+		if len(req.NewPassword) < m.cfg.MinPasswordLength {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("new_password must be at least %d characters", m.cfg.MinPasswordLength),
+			})
+			return
+		}
+		if len(req.NewPassword) > maxPasswordLen {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("new_password must be at most %d bytes", maxPasswordLen),
+			})
 			return
 		}
 		if requireCurrentPassword {
@@ -131,8 +191,7 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "current_password is required"})
 				return
 			}
-			if _, err := m.Users.Authenticate(subject, req.CurrentPassword); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid current_password"})
+			if !m.checkPassword(w, r, subject, req.CurrentPassword, "invalid current_password") {
 				return
 			}
 		}
@@ -144,6 +203,16 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update password"})
 			return
+		}
+		auditLogWithContext(m.db, LogEventPasswordChange, subject, clientIP(r), actorReason(actor.Username, subject), actor.Username, subject, r.Host, "")
+
+		// SetPassword ended every session of the user. The one that just
+		// proved the old password carries on, under a new token.
+		if self {
+			if err := m.adoptCurrentEpoch(r, subject); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
+				return
+			}
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -304,9 +373,16 @@ func (m *Manager) verifyMFA(username, method, code string) (mfaVerifyResult, err
 			if err != nil {
 				return result, fmt.Errorf("decrypt totp secret: %w", err)
 			}
-			if totp.Validate(code, secret) {
-				result.OK = true
-				result.Method = "totp"
+			if step, ok := matchTOTPStep(code, secret, time.Now()); ok {
+				fresh, err := m.Users.consumeTOTPStep(username, step)
+				if err != nil {
+					return result, err
+				}
+				if fresh {
+					result.OK = true
+					result.Method = "totp"
+				}
+				// A replayed code is simply a wrong code.
 				return result, nil
 			}
 		}
@@ -380,19 +456,9 @@ func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubje
 
 		var req regenerateRecoveryCodesRequest
 		_ = decodeJSONBody(w, r, &req)
-		req.Password = strings.TrimSpace(req.Password)
 
-		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
-			if req.Password == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{
-					"error": "re-authentication required (password or recent MFA proof)",
-				})
-				return
-			}
-			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
-				return
-			}
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
+			return
 		}
 
 		auditCtx := AdminAuditContext{
@@ -455,6 +521,20 @@ func (m *Manager) totpEnrollStartHandlerWithResolver(resolve securitySubjectReso
 		}
 		actor, subject, ok := resolve(w, r, "")
 		if !ok {
+			return
+		}
+
+		// Replacing a working second factor needs the same proof as removing
+		// it: the confirmed secret takes over from the active one. A first
+		// enrollment (no MFA yet) needs none, as before.
+		var req mfaDisableRequest
+		_ = decodeJSONBody(w, r, &req)
+		target, err := m.Users.GetByUsername(subject)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+		if target.MFAEnabled && !m.reauthenticate(w, r, actor, subject, req.Password) {
 			return
 		}
 
@@ -564,19 +644,9 @@ func (m *Manager) mfaDisableHandlerWithResolver(resolve securitySubjectResolver)
 
 		var req mfaDisableRequest
 		_ = decodeJSONBody(w, r, &req)
-		req.Password = strings.TrimSpace(req.Password)
 
-		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
-			if req.Password == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{
-					"error": "re-authentication required (password or recent MFA proof)",
-				})
-				return
-			}
-			if _, err := m.Users.Authenticate(subject, req.Password); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid password"})
-				return
-			}
+		if !m.reauthenticate(w, r, actor, subject, req.Password) {
+			return
 		}
 
 		auditCtx := AdminAuditContext{
@@ -713,17 +783,11 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 		}
 
 		// ── Session ───────────────────────────────────────────────────────────
-		// Rotate session ID on login to prevent session fixation.
-		if err := m.session.RenewToken(r.Context()); err != nil {
+		// Rotates the session ID on login to prevent session fixation.
+		if err := m.finalizeAuthenticatedSession(r, user, false); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
 			return
 		}
-
-		rolesJSON, _ := json.Marshal(user.Roles)
-		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
-		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
-		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
-		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
 
 		auditLog(m.db, LogEventSuccess, user.Username, ip, "")
 
@@ -784,20 +848,9 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			return
 		}
 
-		if allowed, retryAfter := m.rl.Allow(ip, username); !allowed {
-			reason := LogReasonTooManyIP
-			if username != "" {
-				reason = LogReasonTooManyUser
-			}
-			auditLog(m.db, LogEventRateLimit, username, ip, reason)
-			secs := int(retryAfter / time.Second)
-			if secs < 1 {
-				secs = 1
-			}
-			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{
-				"error": "too many MFA attempts — please wait before trying again",
-			})
+		if allowed, retryAfter := m.mfaRL.Allow(ip, username); !allowed {
+			auditLog(m.db, LogEventRateLimit, username, ip, "too_many_mfa_attempts")
+			writeTooManyAttempts(w, retryAfter, "too many MFA attempts — please wait before trying again")
 			return
 		}
 
@@ -854,17 +907,11 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 			return
 		}
 
-		if err := m.session.RenewToken(r.Context()); err != nil {
+		if err := m.finalizeAuthenticatedSession(r, user, true); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session error"})
 			return
 		}
-
-		rolesJSON, _ := json.Marshal(user.Roles)
-		m.session.Put(r.Context(), sessionUsernameKey, user.Username)
-		m.session.Put(r.Context(), sessionRolesKey, string(rolesJSON))
-		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
-		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
-		m.writeMFAProof(r)
+		m.mfaRL.ResetUser(username)
 		reason := "mfa_verified"
 		if verify.Method == "recovery_code" {
 			reason = LogReasonMFARecoveryUsed

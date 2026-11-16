@@ -52,9 +52,50 @@ func (s *UserStore) GetOrCreateWebAuthnUserHandle(username string) ([]byte, erro
 	return handle, nil
 }
 
+// Authenticator flag bits as stored in webauthn_credentials.flags.
+const (
+	credFlagUserPresent    = 1
+	credFlagUserVerified   = 2
+	credFlagBackupEligible = 4
+	credFlagBackupState    = 8
+)
+
+func encodeCredentialFlags(f webauthnlib.CredentialFlags) int64 {
+	var v int64
+	if f.UserPresent {
+		v |= credFlagUserPresent
+	}
+	if f.UserVerified {
+		v |= credFlagUserVerified
+	}
+	if f.BackupEligible {
+		v |= credFlagBackupEligible
+	}
+	if f.BackupState {
+		v |= credFlagBackupState
+	}
+	return v
+}
+
+func decodeCredentialFlags(v int64) webauthnlib.CredentialFlags {
+	return webauthnlib.CredentialFlags{
+		UserPresent:    v&credFlagUserPresent != 0,
+		UserVerified:   v&credFlagUserVerified != 0,
+		BackupEligible: v&credFlagBackupEligible != 0,
+		BackupState:    v&credFlagBackupState != 0,
+	}
+}
+
 func (s *UserStore) ListWebAuthnCredentials(username string) ([]webauthnlib.Credential, error) {
+	creds, _, err := s.listWebAuthnCredentials(username)
+	return creds, err
+}
+
+// listWebAuthnCredentials also returns, per credential, whether its
+// authenticator flags are on record (false for rows stored before they were).
+func (s *UserStore) listWebAuthnCredentials(username string) ([]webauthnlib.Credential, []bool, error) {
 	rows, err := s.db.Query(
-		`SELECT c.credential_id, c.public_key, c.sign_count, c.transports
+		`SELECT c.credential_id, c.public_key, c.sign_count, c.transports, c.flags
 		 FROM webauthn_credentials c
 		 JOIN users u ON u.id = c.user_id
 		 WHERE u.username=? COLLATE NOCASE
@@ -62,21 +103,28 @@ func (s *UserStore) ListWebAuthnCredentials(username string) ([]webauthnlib.Cred
 		username,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
+		return nil, nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
 	}
 	defer rows.Close()
 
-	var creds []webauthnlib.Credential
+	var (
+		creds      []webauthnlib.Credential
+		flagsKnown []bool
+	)
 	for rows.Next() {
 		var (
 			cred      webauthnlib.Credential
 			signCount int64
 			trJSON    string
+			flags     sql.NullInt64
 		)
-		if err := rows.Scan(&cred.ID, &cred.PublicKey, &signCount, &trJSON); err != nil {
-			return nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
+		if err := rows.Scan(&cred.ID, &cred.PublicKey, &signCount, &trJSON, &flags); err != nil {
+			return nil, nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
 		}
 		cred.Authenticator.SignCount = uint32(signCount)
+		if flags.Valid {
+			cred.Flags = decodeCredentialFlags(flags.Int64)
+		}
 
 		var transports []string
 		if err := json.Unmarshal([]byte(trJSON), &transports); err == nil {
@@ -86,11 +134,12 @@ func (s *UserStore) ListWebAuthnCredentials(username string) ([]webauthnlib.Cred
 			}
 		}
 		creds = append(creds, cred)
+		flagsKnown = append(flagsKnown, flags.Valid)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
+		return nil, nil, fmt.Errorf("goauth: list webauthn credentials: %w", err)
 	}
-	return creds, nil
+	return creds, flagsKnown, nil
 }
 
 func (s *UserStore) UpsertWebAuthnCredential(username string, userHandle []byte, cred *webauthnlib.Credential) error {
@@ -113,11 +162,11 @@ func (s *UserStore) UpsertWebAuthnCredential(username string, userHandle []byte,
 	}
 	now := time.Now().Unix()
 	_, err = s.db.Exec(
-		`INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, user_handle, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, user_handle, flags, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(user_id, credential_id)
-		 DO UPDATE SET public_key=excluded.public_key, sign_count=excluded.sign_count, transports=excluded.transports, user_handle=excluded.user_handle, updated_at=excluded.updated_at`,
-		userID, cred.ID, cred.PublicKey, cred.Authenticator.SignCount, string(trJSON), userHandle, now, now,
+		 DO UPDATE SET public_key=excluded.public_key, sign_count=excluded.sign_count, transports=excluded.transports, user_handle=excluded.user_handle, flags=excluded.flags, updated_at=excluded.updated_at`,
+		userID, cred.ID, cred.PublicKey, cred.Authenticator.SignCount, string(trJSON), userHandle, encodeCredentialFlags(cred.Flags), now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("goauth: upsert webauthn credential: %w", err)
@@ -135,6 +184,22 @@ func (s *UserStore) UpdateWebAuthnSignCount(username string, credentialID []byte
 	)
 	if err != nil {
 		return fmt.Errorf("goauth: update webauthn sign count: %w", err)
+	}
+	return requireOneRow(res, ErrUserNotFound)
+}
+
+// recordWebAuthnLogin stores what a successful assertion reported: the new
+// signature counter and the authenticator flags.
+func (s *UserStore) recordWebAuthnLogin(username string, cred *webauthnlib.Credential) error {
+	res, err := s.db.Exec(
+		`UPDATE webauthn_credentials
+		 SET sign_count=?, flags=?, updated_at=?
+		 WHERE credential_id=?
+		   AND user_id=(SELECT id FROM users WHERE username=? COLLATE NOCASE)`,
+		cred.Authenticator.SignCount, encodeCredentialFlags(cred.Flags), time.Now().Unix(), cred.ID, username,
+	)
+	if err != nil {
+		return fmt.Errorf("goauth: record webauthn login: %w", err)
 	}
 	return requireOneRow(res, ErrUserNotFound)
 }

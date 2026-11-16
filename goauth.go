@@ -68,6 +68,11 @@ type Config struct {
 	// Defaults to "goauth" when empty.
 	MFAIssuer string
 
+	// MinPasswordLength is the shortest new password the password-change
+	// handlers accept (default: 12). It does not apply to UserStore.Create
+	// and UserStore.SetPassword, which a CLI calls with its own rules.
+	MinPasswordLength int
+
 	// WebAuthnRPID is the relying-party ID (effective domain), e.g. "example.com".
 	// If empty, WebAuthn endpoints are disabled.
 	WebAuthnRPID string
@@ -105,6 +110,9 @@ func (c *Config) withDefaults() {
 	if c.MFAEncryptionKey == "" {
 		c.MFAEncryptionKey = os.Getenv("GOAUTH_MFA_ENCRYPTION_KEY")
 	}
+	if c.MinPasswordLength <= 0 {
+		c.MinPasswordLength = 12
+	}
 	if c.MFAIssuer == "" {
 		c.MFAIssuer = "goauth"
 	}
@@ -121,6 +129,8 @@ type Manager struct {
 	Users     *UserStore
 	session   *scs.SessionManager
 	rl        *loginRateLimiter
+	mfaRL     *loginRateLimiter
+	reauthRL  *loginRateLimiter
 	mfaKey    []byte
 	webAuthn  *webauthnlib.WebAuthn
 }
@@ -159,6 +169,13 @@ func New(cfg Config) (*Manager, error) {
 		}
 		_ = db.Close()
 		return nil, fmt.Errorf("goauth: session migrations: %w", err)
+	}
+	if err := hashLegacySessionTokens(sessionDB); err != nil {
+		if sessionDB != db {
+			_ = sessionDB.Close()
+		}
+		_ = db.Close()
+		return nil, fmt.Errorf("goauth: hash stored session tokens: %w", err)
 	}
 
 	store := newSQLiteSessionStore(sessionDB)
@@ -203,8 +220,16 @@ func New(cfg Config) (*Manager, error) {
 		Users:     &UserStore{db: db},
 		session:   sm,
 		rl:        newLoginRateLimiter(),
-		mfaKey:    mfaKey,
-		webAuthn:  wa,
+		// Second-factor codes: 5 tries per user per 15 minutes. A 6-digit code
+		// has 3 valid values in a million at any moment, and the login limit
+		// (20 per 10 minutes) gave whoever held the password about a 1% chance
+		// a day of guessing one.
+		mfaRL: newRateLimiter(time.Minute, 10, 15*time.Minute, 5),
+		// Password re-checks inside a session (change password, disable MFA,
+		// ...): they had no limit at all.
+		reauthRL: newRateLimiter(time.Minute, 10, 10*time.Minute, 10),
+		mfaKey:   mfaKey,
+		webAuthn: wa,
 	}
 	return m, nil
 }
