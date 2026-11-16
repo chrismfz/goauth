@@ -213,6 +213,7 @@ func (m *Manager) webAuthnRegistrationFinishHandlerWithResolver(resolve security
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load user for passkey registration"})
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		credential, err := m.webAuthn.FinishRegistration(waUser, rec.SessionData, r)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid passkey attestation"})
@@ -248,7 +249,7 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 
 		if username == "" {
 			var req webAuthnLoginBeginRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			if err := decodeJSONBody(w, r, &req); err != nil && !errors.Is(err, io.EOF) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 				return
 			}
@@ -258,6 +259,10 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 				return
 			}
 		} else {
+			if !m.mfaPendingValid(r) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+				return
+			}
 			mode = webauthnLoginModeMFA
 		}
 
@@ -310,6 +315,22 @@ func (m *Manager) WebAuthnLoginBeginHandler() http.HandlerFunc {
 	}
 }
 
+// mfaPendingValid reports whether the session's password-verified MFA login is
+// still inside its deadline, and clears it when it is not. The TOTP verify
+// handler always enforced the deadline; the passkey path did not, so a
+// password-verified session stayed one passkey touch away from a login for the
+// whole session lifetime.
+func (m *Manager) mfaPendingValid(r *http.Request) bool {
+	raw := m.session.GetString(r.Context(), sessionMFAPendingDeadlineKey)
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
+	if raw == "" || err != nil || time.Now().After(deadline) {
+		m.session.Remove(r.Context(), sessionMFAPendingUserKey)
+		m.session.Remove(r.Context(), sessionMFAPendingDeadlineKey)
+		return false
+	}
+	return true
+}
+
 func (m *Manager) finalizeAuthenticatedSession(r *http.Request, user *User) error {
 	if err := m.session.RenewToken(r.Context()); err != nil {
 		return err
@@ -354,6 +375,11 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 		mode := webAuthnLoginMode(m.session.GetString(r.Context(), sessionWebAuthnLoginModeKey))
 		pendingUser := m.session.GetString(r.Context(), sessionMFAPendingUserKey)
 		if pendingUser != "" {
+			if !m.mfaPendingValid(r) {
+				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "MFA challenge expired; please log in again"})
+				return
+			}
 			if !strings.EqualFold(pendingUser, rec.Username) {
 				m.session.Remove(r.Context(), sessionWebAuthnLoginModeKey)
 				m.session.Remove(r.Context(), sessionMFAPendingUserKey)
@@ -365,6 +391,7 @@ func (m *Manager) WebAuthnLoginFinishHandler() http.HandlerFunc {
 			mode = webauthnLoginModeMFA
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		credential, err := m.webAuthn.FinishLogin(waUser, rec.SessionData, r)
 		if err != nil {
 			auditLog(m.db, LogEventFail, rec.Username, ip, "passkey_assertion_failed")

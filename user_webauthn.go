@@ -140,6 +140,11 @@ func (s *UserStore) UpdateWebAuthnSignCount(username string, credentialID []byte
 }
 
 func (s *UserStore) SaveWebAuthnChallenge(challengeID, ceremony, username, sessionData string, expiresAt time.Time) error {
+	// Abandoned ceremonies were never removed: the login-begin endpoint is
+	// unauthenticated and left one row per call, forever.
+	if _, err := s.db.Exec(`DELETE FROM webauthn_challenges WHERE expires_at < ?`, time.Now().Unix()); err != nil {
+		return fmt.Errorf("goauth: prune webauthn challenges: %w", err)
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO webauthn_challenges (challenge_id, challenge_type, username, session_data, expires_at, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,

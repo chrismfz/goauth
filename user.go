@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/argon2id"
@@ -520,8 +521,9 @@ func (s *UserStore) Authenticate(username, password string) (*User, error) {
 	)
 	err := row.Scan(&u.ID, &u.Username, &hash, &roles, &active, &mfaEnabled, &u.MFAType, &totpVerifiedAt, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		// Perform a dummy hash to prevent timing-based username enumeration.
-		argon2id.ComparePasswordAndHash(password, "$argon2id$v=19$m=65536,t=3,p=2$dummysaltdummysalt$dummyhash")
+		// Burn the same Argon2 work as a real comparison, so the response time
+		// does not say whether the username exists.
+		argon2id.ComparePasswordAndHash(password, dummyPasswordHash())
 		return nil, ErrBadCredentials
 	}
 	if err != nil {
@@ -552,6 +554,18 @@ func (s *UserStore) Authenticate(username, password string) (*User, error) {
 }
 
 // --- Helpers ---
+
+// dummyPasswordHash returns a real Argon2id hash, made once with the same
+// parameters Create and SetPassword use. The literal that stood here before
+// was not valid base64, so the comparison failed in microseconds without
+// hashing anything: an unknown username answered ~700x faster than a known one.
+var dummyPasswordHash = sync.OnceValue(func() string {
+	h, err := argon2id.CreateHash("goauth-dummy-password", argon2id.DefaultParams)
+	if err != nil {
+		panic("goauth: create dummy password hash: " + err.Error())
+	}
+	return h
+})
 
 type scanner interface {
 	Scan(dest ...any) error

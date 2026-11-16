@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -108,7 +109,7 @@ func (m *Manager) securityPasswordChangeHandlerWithResolver(resolve securitySubj
 		}
 
 		var req passwordChangeRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -211,23 +212,50 @@ func (m *Manager) securityFactorsHandlerWithResolver(resolve securitySubjectReso
 }
 
 // clientIP extracts the real client IP for audit logging and rate limiting.
-// Trusts X-Forwarded-For only when the direct connection is from loopback.
+//
+// X-Forwarded-For is trusted only when the direct connection is from loopback
+// (a local reverse proxy), and then only its LAST entry: that is the one the
+// proxy itself appended. Everything to its left was sent by the client. The
+// first entry used to be taken, so a client behind a proxy that appends
+// (nginx's $proxy_add_x_forwarded_for) chose its own address, and with it a
+// fresh per-IP rate-limit bucket on every request.
 func clientIP(r *http.Request) string {
-	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	// strip brackets from IPv6
 	host = strings.Trim(host, "[]")
-	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			first := strings.TrimSpace(strings.Split(fwd, ",")[0])
-			if first != "" {
-				return first
-			}
-		}
+	direct := net.ParseIP(host)
+	if direct == nil || !direct.IsLoopback() {
+		return host
+	}
+	values := r.Header.Values("X-Forwarded-For")
+	if len(values) == 0 {
+		return host
+	}
+	parts := strings.Split(values[len(values)-1], ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	if ip := net.ParseIP(last); ip != nil {
+		return ip.String()
 	}
 	return host
+}
+
+// maxRequestBody caps every JSON body the handlers read. The largest
+// legitimate one is a WebAuthn attestation, a few KiB.
+const maxRequestBody = 64 << 10
+
+// Longer credentials are refused before they reach Argon2 or the rate
+// limiter's map.
+const (
+	maxUsernameLen = 255
+	maxPasswordLen = 1024
+)
+
+// decodeJSONBody decodes a size-capped JSON body into v.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
 func mfaMethods(user *User) []string {
@@ -351,7 +379,7 @@ func (m *Manager) mfaRecoveryRegenerateHandlerWithResolver(resolve securitySubje
 		}
 
 		var req regenerateRecoveryCodesRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = decodeJSONBody(w, r, &req)
 		req.Password = strings.TrimSpace(req.Password)
 
 		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
@@ -476,7 +504,7 @@ func (m *Manager) totpEnrollConfirmHandlerWithResolver(resolve securitySubjectRe
 			return
 		}
 		var req totpEnrollConfirmRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -535,7 +563,7 @@ func (m *Manager) mfaDisableHandlerWithResolver(resolve securitySubjectResolver)
 		}
 
 		var req mfaDisableRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = decodeJSONBody(w, r, &req)
 		req.Password = strings.TrimSpace(req.Password)
 
 		if !m.hasRecentMFAProof(r) && strings.EqualFold(actor.Username, subject) {
@@ -624,8 +652,16 @@ func (m *Manager) LoginHandler() http.HandlerFunc {
 		ip := clientIP(r)
 
 		var req loginRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		// The limiter key and the audit row are attacker-chosen: bound them.
+		if len(req.Username) > maxUsernameLen || len(req.Password) > maxPasswordLen {
+			m.rl.Allow(ip, "")
+			auditLog(m.db, LogEventFail, req.Username[:min(len(req.Username), maxUsernameLen)], ip, LogReasonBadCredentials)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 			return
 		}
 
@@ -735,7 +771,7 @@ func (m *Manager) LoginMFAVerifyHandler() http.HandlerFunc {
 		}
 
 		var req loginMFAVerifyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}

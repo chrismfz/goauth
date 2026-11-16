@@ -1,6 +1,7 @@
 package goauth
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,6 +56,9 @@ func (rl *loginRateLimiter) Allow(ip, username string) (bool, time.Duration) {
 	rl.byIP[ip] = append(rl.byIP[ip], now)
 
 	// ── Per-username check ────────────────────────────────────────────────────
+	// Usernames match case-insensitively in the database, so they must here
+	// too: "admin", "Admin" and "ADMIN" used to get a bucket each.
+	username = strings.ToLower(strings.TrimSpace(username))
 	if username != "" {
 		key := "u:" + username
 		rl.byUser[key] = recentTimestamps(rl.byUser[key], rl.windowUser, now)
